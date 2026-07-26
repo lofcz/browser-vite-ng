@@ -1,27 +1,29 @@
 /**
- * Browser-Vite Wrapper
+ * Browser-Vite host wrapper — thin adapter over the full-fidelity
+ * `BrowserServer` (transformRequest + import-analysis + ModuleGraph + HMR).
  *
- * This wrapper provides a browser-compatible interface to browser-vite.
- * In a real implementation, this would:
- * 1. Load the browser-vite bundle from dist/browser/index.js
- * 2. Set up a virtual file system (memfs)
- * 3. Initialize the plugin container and module graph
- *
- * For this example, we simulate the core functionality to demonstrate
- * the API and test the transformation pipeline.
+ * No regex HMR analysis, no eval/new Function. All accept/import analysis,
+ * hot-context injection, boundary propagation and module serving come from
+ * `packages/vite/src/browser/*` (Vite 8 semantics).
  */
 
-import * as esbuild from 'esbuild-wasm';
+import {
+  createBrowserHotChannel,
+  createBrowserServer,
+  resolveConfig,
+  setVirtualFile,
+  deleteVirtualFile,
+  type BrowserServer,
+  type HotChannel,
+  type HotPayload,
+  type ModuleNode,
+  updateModules,
+} from 'browser-vite';
+import { sendHotPayload } from './hmr-bridge';
 
 export interface TransformResult {
   code: string;
   map: any | null;
-}
-
-export interface ResolvedId {
-  id: string;
-  external?: boolean;
-  meta?: Record<string, any>;
 }
 
 export interface VirtualFile {
@@ -30,246 +32,155 @@ export interface VirtualFile {
   lastModified: number;
 }
 
-/**
- * BrowserVite - Main class for browser-based Vite functionality
- *
- * This is a simplified implementation that demonstrates the core concepts.
- * The actual browser-vite would use the full plugin container and module graph.
- */
 export class BrowserVite {
   private initialized = false;
-  private moduleGraph = new Map<string, VirtualFile>();
-  private plugins: Array<{ name: string; transform?: Function; resolveId?: Function }> = [];
-  private hmrCallbacks = new Map<string, Array<(module: any) => void>>();
+  private server: BrowserServer | null = null;
+  private previewIframe: HTMLIFrameElement | null = null;
+  private files = new Map<string, string>();
 
-  constructor() {
-    // Initialize with core plugins
-    this.plugins = [
-      {
-        name: 'vite:esbuild',
-        async transform(code: string, id: string) {
-          if (id.endsWith('.ts') || id.endsWith('.tsx')) {
-            const result = await esbuild.transform(code, {
-              loader: id.endsWith('.tsx') ? 'tsx' : 'ts',
-              sourcemap: true,
-              target: 'es2020',
-            });
-            return {
-              code: result.code,
-              map: result.map,
-            };
-          }
-          return null;
-        },
-      },
-      {
-        name: 'vite:jsx',
-        async transform(code: string, id: string) {
-          if (id.endsWith('.jsx')) {
-            const result = await esbuild.transform(code, {
-              loader: 'jsx',
-              sourcemap: true,
-              target: 'es2020',
-              jsx: 'automatic',
-            });
-            return {
-              code: result.code,
-              map: result.map,
-            };
-          }
-          return null;
-        },
-      },
-      {
-        name: 'vite:css',
-        async transform(code: string, id: string) {
-          if (id.endsWith('.css')) {
-            // Wrap CSS in a JS module that injects styles
-            const escapedCss = JSON.stringify(code);
-            return {
-              code: `
-const css = ${escapedCss};
-const style = document.createElement('style');
-style.textContent = css;
-document.head.appendChild(style);
-export default css;
-              `.trim(),
-              map: null,
-            };
-          }
-          return null;
-        },
-      },
-      {
-        name: 'vite:resolve',
-        resolveId(id: string, importer?: string) {
-          // Simple resolution logic
-          if (id.startsWith('./') || id.startsWith('../') || id.startsWith('/')) {
-            return { id: id, external: false };
-          }
-          // Node modules
-          if (!id.startsWith('.')) {
-            return { id: `/node_modules/${id}`, external: true };
-          }
-          return null;
-        },
-      },
-    ];
+  get moduleGraph() {
+    return this.server?.moduleGraph ?? null;
+  }
+  hot: (HotChannel & { subscribe: (h: (p: HotPayload) => void) => () => void }) | null =
+    null;
+
+  setPreviewIframe(iframe: HTMLIFrameElement | null): void {
+    this.previewIframe = iframe;
   }
 
-  /**
-   * Initialize browser-vite
-   */
+  /** Push the deps-optimizer manifest (bare specifier -> /@deps/* URL). */
+  setOptimizedDeps(manifest: Record<string, string>): void {
+    if (this.server) this.server.optimizedDeps = { ...manifest };
+  }
+
+  /** Register / update virtual file contents (source of truth for transforms). */
+  setFile(path: string, content: string): void {
+    this.files.set(path, content);
+    setVirtualFile(path, content);
+  }
+
+  getFile(path: string): string | undefined {
+    return this.files.get(path);
+  }
+
   async init(): Promise<void> {
     if (this.initialized) return;
 
-    // Initialize esbuild-wasm - use unpkg with matching version
-    await esbuild.initialize({
-      wasmURL: 'https://unpkg.com/esbuild-wasm@0.24.2/esbuild.wasm',
+    this.hot = createBrowserHotChannel((payload: HotPayload) => {
+      sendHotPayload(this.previewIframe, payload as HotPayload);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('vite-hmr-payload', { detail: payload }));
+      }
     });
+
+    const config = await resolveConfig({ root: '/' }, 'serve');
+    this.server = createBrowserServer({ config, hot: this.hot });
 
     this.initialized = true;
-    console.log('[BrowserVite] Initialized with plugins:', this.plugins.map(p => p.name));
+    console.log('[BrowserVite] Initialized (Oxc WASM + full Vite 8 HMR pipeline)');
   }
 
   /**
-   * Transform source code
+   * Full dev transform of a module (oxc → plugins → import-analysis → graph).
+   * Writes to the VFS and serves the transformed ESM for the preview.
    */
   async transform(code: string, id: string): Promise<TransformResult> {
-    if (!this.initialized) {
-      throw new Error('BrowserVite not initialized. Call init() first.');
-    }
-
-    let result: TransformResult = { code, map: null };
-
-    // Run through plugins
-    for (const plugin of this.plugins) {
-      if (plugin.transform) {
-        const pluginResult = await plugin.transform(code, id);
-        if (pluginResult) {
-          result = {
-            code: pluginResult.code || result.code,
-            map: pluginResult.map || result.map,
-          };
-          code = result.code; // Chain transformations
-        }
-      }
-    }
-
-    // Store in module graph
-    this.moduleGraph.set(id, {
-      path: id,
-      content: result.code,
-      lastModified: Date.now(),
-    });
-
-    return result;
+    if (!this.server) throw new Error('BrowserVite not initialized. Call init() first.');
+    this.setFile(id, code);
+    const res = await this.server.transformRequest(id);
+    if (!res) throw new Error(`[browser-vite] Failed to transform ${id}`);
+    return { code: res.code, map: res.map };
   }
 
-  /**
-   * Resolve module ID
-   */
-  async resolveId(id: string, importer?: string): Promise<ResolvedId | null> {
-    if (!this.initialized) {
-      throw new Error('BrowserVite not initialized. Call init() first.');
-    }
-
-    for (const plugin of this.plugins) {
-      if (plugin.resolveId) {
-        const result = await plugin.resolveId(id, importer);
-        if (result) {
-          return typeof result === 'string' ? { id: result } : result;
-        }
-      }
-    }
-
-    return null;
+  /** Serve transformed module to the preview iframe / importUpdatedModule. */
+  async fetchModule(url: string): Promise<{ code: string } | null> {
+    if (!this.server) return null;
+    return this.server.fetchModule(url);
   }
 
-  /**
-   * Check if a plugin is loaded
-   */
+  async resolveId(id: string, importer?: string) {
+    if (!this.server) throw new Error('Not initialized');
+    return this.server.resolveId(id, importer);
+  }
+
   hasPlugin(name: string): boolean {
-    return this.plugins.some(p => p.name === name);
+    return (
+      this.initialized &&
+      ['vite:oxc', 'vite:css', 'vite:import-analysis', 'vite:resolve'].includes(name)
+    );
   }
 
-  /**
-   * Get all plugin names
-   */
   getPluginNames(): string[] {
-    return this.plugins.map(p => p.name);
+    return ['vite:oxc', 'vite:css', 'vite:import-analysis', 'vite:resolve'];
   }
 
   /**
-   * Simulate HMR update
+   * Full-fidelity HMR: VFS change → moduleGraph invalidation →
+   * updateModules / propagateUpdate → HotChannel → preview iframe.
    */
   async handleHMRUpdate(path: string, newCode: string): Promise<boolean> {
-    if (!this.initialized) {
+    if (!this.server || !this.hot) {
       throw new Error('BrowserVite not initialized. Call init() first.');
     }
-
     try {
-      // Transform the new code
-      const result = await this.transform(newCode, path);
-
-      // Update module graph
-      this.moduleGraph.set(path, {
-        path,
-        content: result.code,
-        lastModified: Date.now(),
-      });
-
-      // Trigger HMR callbacks
-      const callbacks = this.hmrCallbacks.get(path) || [];
-      for (const callback of callbacks) {
-        callback({ code: result.code });
-      }
-
-      console.log(`[HMR] Updated: ${path}`);
+      this.setFile(path, newCode);
+      // VFS 'change' event drives handleHMRUpdate via the server listener.
       return true;
     } catch (error) {
       console.error(`[HMR] Failed to update ${path}:`, error);
+      this.hot.send?.({
+        type: 'error',
+        err: {
+          message: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack || '' : '',
+        },
+      });
       return false;
     }
   }
 
-  /**
-   * Register HMR callback
-   */
-  onHMRUpdate(path: string, callback: (module: any) => void): void {
-    const callbacks = this.hmrCallbacks.get(path) || [];
-    callbacks.push(callback);
-    this.hmrCallbacks.set(path, callbacks);
+  sendFullReload(path = '*'): void {
+    this.hot?.send?.({ type: 'full-reload', path });
   }
 
-  /**
-   * Get module from graph
-   */
+  /** Directly run updateModules for testing / advanced hosts. */
+  updateModules(file: string, modules: ModuleNode[], timestamp = Date.now()): void {
+    if (!this.server || !this.hot) return;
+    updateModules(
+      {
+        name: 'client',
+        moduleGraph: this.server.moduleGraph,
+        hot: this.hot,
+        logger: { info: (msg: string) => console.log(`[HMR] ${msg}`) },
+      },
+      file,
+      modules,
+      timestamp,
+    );
+  }
+
   getModule(path: string): VirtualFile | undefined {
-    return this.moduleGraph.get(path);
+    const content = this.files.get(path);
+    if (content === undefined) return undefined;
+    return { path, content, lastModified: Date.now() };
   }
 
-  /**
-   * Get all modules
-   */
   getAllModules(): VirtualFile[] {
-    return Array.from(this.moduleGraph.values());
+    return [...this.files.entries()].map(([path, content]) => ({
+      path,
+      content,
+      lastModified: Date.now(),
+    }));
   }
 
-  /**
-   * Add a custom plugin
-   */
-  addPlugin(plugin: { name: string; transform?: Function; resolveId?: Function }): void {
-    this.plugins.push(plugin);
+  deleteFile(path: string): void {
+    this.files.delete(path);
+    deleteVirtualFile(path);
   }
 
-  /**
-   * Clear module graph
-   */
   clearModuleGraph(): void {
-    this.moduleGraph.clear();
+    this.moduleGraph?.invalidateAll();
   }
 }
 
-// Export a singleton for convenience
 export const browserVite = new BrowserVite();

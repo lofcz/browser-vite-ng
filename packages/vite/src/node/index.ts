@@ -1,103 +1,295 @@
-export * from './config'
-export { createServer, searchForWorkspaceRoot } from './server'
-export { createPluginContainer } from './server/pluginContainer'
+import type * as Rolldown from 'rolldown'
+import {
+  parseAst as _parseAst,
+  parseAstAsync as _parseAstAsync,
+} from 'rolldown/parseAst'
+import type * as Rollup from '#types/internal/rollupTypeCompat'
+
+export type { Rollup, Rolldown }
+export { esmExternalRequirePlugin } from 'rolldown/plugins'
+export {
+  parse,
+  parseSync,
+  type ParserOptions,
+  type ParseResult,
+  minify,
+  minifySync,
+  type MinifyOptions,
+  type MinifyResult,
+  Visitor,
+  type VisitorObject,
+  type ESTree,
+} from 'rolldown/utils'
+
+/** @deprecated - use `parseSync` instead */
+export const parseAst: typeof _parseAst = _parseAst
+/** @deprecated - use `parse` instead */
+export const parseAstAsync: typeof _parseAstAsync = _parseAstAsync
+
+export {
+  defineConfig,
+  loadConfigFromFile,
+  resolveConfig,
+  sortUserPlugins,
+} from './config'
+export { perEnvironmentPlugin } from './plugin'
+export { perEnvironmentState } from './environment'
+export { createServer } from './server'
 export { preview } from './preview'
-export { build } from './build'
+export { build, createBuilder } from './build'
+
 export { optimizeDeps } from './optimizer'
-export { scanImports } from './optimizer/scan'
-export { send } from './server/send'
-export { createLogger, printHttpServerUrls } from './logger'
+export { createIdResolver } from './idResolver'
+
+export { formatPostcssSourceMap, preprocessCSS } from './plugins/css'
 export { transformWithEsbuild } from './plugins/esbuild'
-export { resolvePackageEntry } from './plugins/resolve'
-export { resolvePackageData } from './packages'
+export { transformWithOxc } from './plugins/oxc'
+export { buildErrorMessage } from './server/middlewares/error'
+
+export {
+  createRunnableDevEnvironment,
+  isRunnableDevEnvironment,
+  type RunnableDevEnvironment,
+  type RunnableDevEnvironmentContext,
+} from './server/environments/runnableEnvironment'
+export {
+  createFetchableDevEnvironment,
+  isFetchableDevEnvironment,
+  type FetchableDevEnvironment,
+  type FetchableDevEnvironmentContext,
+} from './server/environments/fetchableEnvironments'
+export {
+  DevEnvironment,
+  type DevEnvironmentContext,
+} from './server/environment'
+export { runnerImport } from './ssr/runnerImport'
+export { BuildEnvironment } from './build'
+
+export { fetchModule, type FetchModuleOptions } from './ssr/fetchModule'
+export {
+  createServerModuleRunner,
+  createServerModuleRunnerTransport,
+} from './ssr/runtime/serverModuleRunner'
+export { createServerHotChannel } from './server/hmr'
+export { ssrTransform as moduleRunnerTransform } from './ssr/ssrTransform'
+export type { ModuleRunnerTransformOptions } from './ssr/ssrTransform'
+
+export {
+  VERSION as version,
+  DEFAULT_CLIENT_CONDITIONS as defaultClientConditions,
+  DEFAULT_CLIENT_MAIN_FIELDS as defaultClientMainFields,
+  DEFAULT_EXTERNAL_CONDITIONS as defaultExternalConditions,
+  DEFAULT_SERVER_CONDITIONS as defaultServerConditions,
+  DEFAULT_SERVER_MAIN_FIELDS as defaultServerMainFields,
+  defaultAllowedOrigins,
+} from './constants'
+// NOTE: export for backward compat
+export const esbuildVersion = '0.25.0'
 export {
   normalizePath,
-  flattenId,
-  injectQuery,
-  removeImportQuery,
-  unwrapId,
-  generateCodeFrame,
-  posToNumber
+  mergeConfig,
+  mergeAlias,
+  createFilter,
+  withFilter,
+  isCSSRequest,
+  rollupVersion,
+  rolldownVersion,
 } from './utils'
-export { createDevHtmlTransformFn } from './server/middlewares/indexHtml'
+export { send } from './server/send'
+export { createLogger } from './logger'
+export { searchForWorkspaceRoot } from './server/searchRoot'
+
+export {
+  isFileServingAllowed,
+  isFileLoadingAllowed,
+} from './server/middlewares/static'
+export { loadEnv, resolveEnvPrefix } from './env'
 
 // additional types
+export type {
+  AppType,
+  ConfigEnv,
+  ExperimentalOptions,
+  HTMLOptions,
+  InlineConfig,
+  LegacyOptions,
+  PluginHookUtils,
+  ResolveFn,
+  ResolvedWorkerOptions,
+  ResolvedConfig,
+  UserConfig,
+  UserConfigExport,
+  UserConfigFn,
+  UserConfigFnObject,
+  UserConfigFnPromise,
+  EnvironmentOptions,
+  DevEnvironmentOptions,
+  ResolvedDevEnvironmentOptions,
+} from './config'
+export type { HtmlAssetSource } from './assetSource'
+export type {
+  Plugin,
+  PluginOption,
+  HookHandler,
+  ConfigPluginContext,
+  MinimalPluginContextWithoutEnvironment,
+} from './plugin'
+export type { Environment } from './environment'
+export type { FilterPattern } from './utils'
 export type { CorsOptions, CorsOrigin, CommonServerOptions } from './http'
 export type {
   ViteDevServer,
   ServerOptions,
   FileSystemServeOptions,
   ServerHook,
-  ResolvedServerOptions
+  ResolvedServerOptions,
+  ResolvedServerUrls,
+  HttpServer,
 } from './server'
 export type {
+  ViteBuilder,
+  BuildAppHook,
+  BuilderOptions,
   BuildOptions,
+  BuildEnvironmentOptions,
   LibraryOptions,
   LibraryFormats,
-  ResolvedBuildOptions
+  RenderBuiltAssetUrl,
+  ResolvedBuildOptions,
+  ResolvedBuildEnvironmentOptions,
+  ModulePreloadOptions,
+  ResolvedModulePreloadOptions,
+  ResolveModulePreloadDependenciesFn,
 } from './build'
 export type {
   PreviewOptions,
   PreviewServer,
-  ResolvedPreviewOptions
+  PreviewServerHook,
+  ResolvedPreviewOptions,
 } from './preview'
 export type {
   DepOptimizationMetadata,
-  DepOptimizationOptions
+  DepOptimizationOptions,
+  DepOptimizationConfig,
+  OptimizedDepInfo,
+  ExportsData,
 } from './optimizer'
-export type { Plugin } from './plugin'
-export type { PackageCache, PackageData } from './packages'
+export type {
+  ResolvedSSROptions,
+  SsrDepOptimizationConfig,
+  SSROptions,
+  SSRTarget,
+} from './ssr'
 export type {
   Logger,
   LogOptions,
   LogErrorOptions,
   LogLevel,
   LogType,
-  LoggerOptions
+  LoggerOptions,
 } from './logger'
-export type {
-  AliasOptions,
-  ResolverFunction,
-  ResolverObject,
-  Alias
-} from 'types/alias'
 export type {
   IndexHtmlTransform,
   IndexHtmlTransformHook,
   IndexHtmlTransformContext,
   IndexHtmlTransformResult,
-  HtmlTagDescriptor
+  HtmlTagDescriptor,
 } from './plugins/html'
-export type { CSSOptions, CSSModulesOptions } from './plugins/css'
+export type {
+  CSSOptions,
+  CSSModulesOptions,
+  PreprocessCSSResult,
+  ResolvedCSSOptions,
+  SassPreprocessorOptions,
+  LessPreprocessorOptions,
+  StylusPreprocessorOptions,
+} from './plugins/css'
 export type { JsonOptions } from './plugins/json'
-export type { TransformOptions as EsbuildTransformOptions } from 'esbuild'
-export type { ESBuildOptions, ESBuildTransformResult } from './plugins/esbuild'
+export type { ESBuildOptions } from './plugins/esbuild'
+export type { EsbuildTransformOptions } from '#types/internal/esbuildOptions'
+export type { OxcOptions } from './plugins/oxc'
 export type { Manifest, ManifestChunk } from './plugins/manifest'
 export type { ResolveOptions, InternalResolveOptions } from './plugins/resolve'
-export type { WebSocketServer } from './server/ws'
-export type { PluginContainer } from './server/pluginContainer'
-export type { ModuleGraph, ModuleNode, ResolvedUrl } from './server/moduleGraph'
+export type { TerserOptions } from './plugins/terser'
+
+export type {
+  WebSocketServer,
+  WebSocketClient,
+  WebSocketCustomListener,
+} from './server/ws'
+export type { SkipInformation, PluginContainer } from './server/pluginContainer'
+export type {
+  EnvironmentModuleGraph,
+  EnvironmentModuleNode,
+  ResolvedUrl,
+} from './server/moduleGraph'
+export type { SendOptions } from './server/send'
 export type { ProxyOptions } from './server/middlewares/proxy'
 export type {
   TransformOptions,
-  TransformResult
+  TransformResult,
 } from './server/transformRequest'
-export type { HmrOptions, HmrContext } from './server/hmr'
+export type {
+  HmrOptions,
+  WsOptions,
+  HmrContext,
+  HotUpdateOptions,
+  HotChannelListener,
+  HotChannel,
+  ServerHotChannel,
+  HotChannelClient,
+  NormalizedHotChannel,
+  NormalizedHotChannelClient,
+  NormalizedServerHotChannel,
+} from './server/hmr'
+
+export type { FetchFunction, FetchResult } from 'vite/module-runner'
+export type { ServerModuleRunnerOptions } from './ssr/runtime/serverModuleRunner'
+
+export type { BindCLIShortcutsOptions, CLIShortcut } from './shortcuts'
+
 export type {
   HMRPayload,
+  HotPayload,
   ConnectedPayload,
   UpdatePayload,
   Update,
   FullReloadPayload,
   CustomPayload,
   PrunePayload,
-  ErrorPayload
-} from 'types/hmrPayload'
-export type { Connect } from 'types/connect'
-export type { WebSocket } from 'types/ws'
-export type { HttpProxy } from 'types/http-proxy'
-export type { FSWatcher, WatchOptions } from 'types/chokidar'
-export type { Terser } from 'types/terser'
-export type { RollupCommonJSOptions } from 'types/commonjs'
-export type { RollupDynamicImportVarsOptions } from 'types/dynamicImportVars'
-export type { Matcher, AnymatchPattern, AnymatchFn } from 'types/anymatch'
+  ErrorPayload,
+} from '#types/hmrPayload'
+export type {
+  CustomEventMap,
+  InferCustomEventPayload,
+  InvalidatePayload,
+} from '#types/customEvent'
+export type {
+  ImportGlobFunction,
+  ImportGlobOptions,
+  GeneralImportGlobOptions,
+  KnownAsTypeMap,
+  KnownQueryTypeMap,
+} from '#types/importGlob'
+export type { ChunkMetadata, CustomPluginOptionsVite } from '#types/metadata'
+
+// dep types
+export type {
+  AliasOptions,
+  MapToFunction,
+  ResolverFunction,
+  ResolverObject,
+  Alias,
+} from '#dep-types/alias'
+export type { Connect } from '#dep-types/connect'
+export type { WebSocket, WebSocketAlias } from '#dep-types/ws'
+export type * as HttpProxy from 'http-proxy-3'
+export type { FSWatcher, WatchOptions } from '#dep-types/chokidar'
+export type { Terser } from '#types/internal/terserOptions'
+export type { RollupCommonJSOptions } from '#dep-types/commonjs'
+export type { RollupDynamicImportVarsOptions } from '#dep-types/dynamicImportVars'
+export type { Matcher, AnymatchPattern, AnymatchFn } from '#dep-types/anymatch'
+export type { LightningCSSOptions } from '#types/internal/lightningcssOptions'
+
+// Backward compatibility
+export type { ModuleGraph, ModuleNode } from './server/mixedModuleGraph'

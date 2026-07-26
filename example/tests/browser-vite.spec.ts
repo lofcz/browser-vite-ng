@@ -9,15 +9,20 @@ import { test, expect, Page } from '@playwright/test';
 
 // Helper to wait for browser-vite initialization
 async function waitForBrowserViteReady(page: Page, timeout = 30000): Promise<void> {
-  // Wait for status to show success or error
-  await page.waitForSelector('.status.success, .status.error', { timeout });
+  // setStatus writes the message + Tailwind classes (no .status/.success class).
+  // Ready is signalled by the text content becoming "Ready!".
+  await page.waitForFunction(
+    () => {
+      const el = document.getElementById('status');
+      return el && (el.textContent === 'Ready!' || el.textContent?.startsWith('Error'));
+    },
+    { timeout },
+  );
 
-  // Check if there was an error
-  const statusEl = await page.locator('.status');
-  const statusClass = await statusEl.getAttribute('class');
-  if (statusClass?.includes('error')) {
-    const errorText = await statusEl.textContent();
-    throw new Error(`Browser-vite initialization failed: ${errorText}`);
+  const statusEl = page.locator('#status');
+  const text = await statusEl.textContent();
+  if (text?.startsWith('Error')) {
+    throw new Error(`Browser-vite initialization failed: ${text}`);
   }
 }
 
@@ -37,9 +42,8 @@ test.describe('Browser-Vite Initialization', () => {
     await page.goto('/');
     await waitForBrowserViteReady(page);
 
-    // Check status shows success
+    // Check status shows success (text-based; className is Tailwind utilities)
     const status = page.locator('#status');
-    await expect(status).toHaveClass(/success/);
     await expect(status).toContainText('Ready');
   });
 
@@ -311,8 +315,8 @@ test.describe('New File Modal', () => {
     // Click new file button
     await page.click('#newFileBtn');
 
-    // Modal should be visible
-    await expect(page.locator('#newFileModal')).toHaveClass(/visible/);
+    // Modal should be visible (code toggles hidden/flex)
+    await expect(page.locator('#newFileModal')).not.toHaveClass(/hidden/);
   });
 
   test('should close modal on cancel', async ({ page }) => {
@@ -320,10 +324,10 @@ test.describe('New File Modal', () => {
     await waitForBrowserViteReady(page);
 
     await page.click('#newFileBtn');
-    await expect(page.locator('#newFileModal')).toHaveClass(/visible/);
+    await expect(page.locator('#newFileModal')).not.toHaveClass(/hidden/);
 
     await page.click('#cancelNewFile');
-    await expect(page.locator('#newFileModal')).not.toHaveClass(/visible/);
+    await expect(page.locator('#newFileModal')).toHaveClass(/hidden/);
   });
 
   test('should create new file', async ({ page }) => {
@@ -340,7 +344,7 @@ test.describe('New File Modal', () => {
     await page.click('#createNewFile');
 
     // Modal should close
-    await expect(page.locator('#newFileModal')).not.toHaveClass(/visible/);
+    await expect(page.locator('#newFileModal')).toHaveClass(/hidden/);
 
     // New file should appear in tree
     await expect(page.locator('#fileTree')).toContainText('NewComponent.tsx');

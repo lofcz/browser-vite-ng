@@ -1,69 +1,30 @@
-interface ImportMeta {
-  url: string
+// This file is an augmentation to the built-in ImportMeta interface
+// Thus cannot contain any top-level imports
+// <https://www.typescriptlang.org/docs/handbook/declaration-merging.html#module-augmentation>
 
-  readonly hot?: {
-    readonly data: any
-
-    accept(): void
-    accept(cb: (mod: any) => void): void
-    accept(dep: string, cb: (mod: any) => void): void
-    accept(deps: readonly string[], cb: (mods: any[]) => void): void
-
-    /**
-     * @deprecated
-     */
-    acceptDeps(): never
-
-    dispose(cb: (data: any) => void): void
-    decline(): void
-    invalidate(): void
-
-    on: {
-      (
-        event: 'vite:beforeUpdate',
-        cb: (payload: import('./hmrPayload').UpdatePayload) => void
-      ): void
-      (
-        event: 'vite:beforePrune',
-        cb: (payload: import('./hmrPayload').PrunePayload) => void
-      ): void
-      (
-        event: 'vite:beforeFullReload',
-        cb: (payload: import('./hmrPayload').FullReloadPayload) => void
-      ): void
-      (
-        event: 'vite:error',
-        cb: (payload: import('./hmrPayload').ErrorPayload) => void
-      ): void
-      <T extends string>(
-        event: import('./customEvent').CustomEventName<T>,
-        cb: (data: any) => void
-      ): void
-    }
-  }
-
-  readonly env: ImportMetaEnv
-
-  glob(pattern: string): Record<
-    string,
-    () => Promise<{
-      [key: string]: any
-    }>
-  >
-
-  globEager(pattern: string): Record<
-    string,
-    {
-      [key: string]: any
-    }
-  >
+// This is tested in `packages/vite/src/node/__tests_dts__/typeOptions.ts`
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type -- to allow extending by users
+interface ViteTypeOptions {
+  // strictImportMetaEnv: unknown
 }
 
-interface ImportMetaEnv {
-  [key: string]: string | boolean | undefined
+type ImportMetaEnvFallbackKey =
+  'strictImportMetaEnv' extends keyof ViteTypeOptions ? never : string
+
+interface ImportMetaEnv extends Record<ImportMetaEnvFallbackKey, any> {
   BASE_URL: string
   MODE: string
   DEV: boolean
   PROD: boolean
   SSR: boolean
+}
+
+interface ImportMeta {
+  url: string
+
+  readonly hot?: import('./hot.js').ViteHotContext
+
+  readonly env: ImportMetaEnv
+
+  glob: import('./importGlob.js').ImportGlobFunction
 }

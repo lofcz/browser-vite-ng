@@ -1,127 +1,186 @@
+import { beforeEach, describe, expect, test, vi } from 'vitest'
 import { transformCjsImport } from '../../plugins/importAnalysis'
 
-describe('transformCjsImport', () => {
-  const url = './node_modules/.vite/react.js'
-  const rawUrl = 'react'
+describe('runTransform', () => {
+  const config: any = {
+    command: 'serve',
+    logger: {
+      warn: vi.fn(),
+    },
+  }
+
+  function runTransformCjsImport(importExp: string, isNodeMode: boolean) {
+    const result = transformCjsImport(
+      importExp,
+      './node_modules/.vite/deps/react.js',
+      'react',
+      0,
+      'modA',
+      isNodeMode,
+      config,
+    )
+    if (result === undefined) return undefined
+    const joined = result.hoistedAssignments
+      ? `${result.hoistedAssignments}; ${result.importLine}`
+      : result.importLine
+    expect(joined.split('\n').length, 'result line count').toBe(
+      importExp.split('\n').length,
+    )
+    return joined.replaceAll(';', ';\n')
+  }
+
+  beforeEach(() => {
+    config.logger.warn.mockClear()
+  })
 
   test('import specifier', () => {
     expect(
-      transformCjsImport(
-        'import { useState, Component } from "react"',
-        url,
-        rawUrl,
-        0
-      )
-    ).toBe(
-      'import __vite__cjsImport0_react from "./node_modules/.vite/react.js"; ' +
-        'const useState = __vite__cjsImport0_react["useState"]; ' +
-        'const Component = __vite__cjsImport0_react["Component"]'
-    )
+      runTransformCjsImport(
+        'import { useState, Component, "👋" as fake } from "react"',
+        false,
+      ),
+    ).toMatchInlineSnapshot(`
+      "const useState = __vite__cjsImport0_react["useState"];
+       const Component = __vite__cjsImport0_react["Component"];
+       const fake = __vite__cjsImport0_react["👋"];
+       import __vite__cjsImport0_react from "./node_modules/.vite/deps/react.js""
+    `)
+    expect(
+      runTransformCjsImport(
+        'import { useState, Component, "👋" as fake } from "react"',
+        true,
+      ),
+    ).toMatchInlineSnapshot(`
+      "const useState = __vite__cjsImport0_react["useState"];
+       const Component = __vite__cjsImport0_react["Component"];
+       const fake = __vite__cjsImport0_react["👋"];
+       import __vite__cjsImport0_react from "./node_modules/.vite/deps/react.js""
+    `)
   })
 
   test('import default specifier', () => {
-    expect(
-      transformCjsImport('import React from "react"', url, rawUrl, 0)
-    ).toBe(
-      'import __vite__cjsImport0_react from "./node_modules/.vite/react.js"; ' +
-        'const React = __vite__cjsImport0_react.__esModule ? __vite__cjsImport0_react.default : __vite__cjsImport0_react'
-    )
+    expect(runTransformCjsImport('import React from "react"', false))
+      .toMatchInlineSnapshot(`
+      "const React = !__vite__cjsImport0_react.__esModule ? __vite__cjsImport0_react : __vite__cjsImport0_react.default;
+       import __vite__cjsImport0_react from "./node_modules/.vite/deps/react.js""
+    `)
+    expect(runTransformCjsImport('import React from "react"', true))
+      .toMatchInlineSnapshot(`
+        "const React = __vite__cjsImport0_react;
+         import __vite__cjsImport0_react from "./node_modules/.vite/deps/react.js""
+      `)
 
     expect(
-      transformCjsImport(
-        'import { default as React } from "react"',
-        url,
-        rawUrl,
-        0
-      )
-    ).toBe(
-      'import __vite__cjsImport0_react from "./node_modules/.vite/react.js"; ' +
-        'const React = __vite__cjsImport0_react.__esModule ? __vite__cjsImport0_react.default : __vite__cjsImport0_react'
-    )
+      runTransformCjsImport('import { default as React } from "react"', false),
+    ).toMatchInlineSnapshot(`
+      "const React = !__vite__cjsImport0_react.__esModule ? __vite__cjsImport0_react : __vite__cjsImport0_react.default;
+       import __vite__cjsImport0_react from "./node_modules/.vite/deps/react.js""
+    `)
   })
 
   test('import all specifier', () => {
-    expect(
-      transformCjsImport('import * as react from "react"', url, rawUrl, 0)
-    ).toBe(
-      'import __vite__cjsImport0_react from "./node_modules/.vite/react.js"; ' +
-        'const react = __vite__cjsImport0_react'
-    )
+    expect(runTransformCjsImport('import * as react from "react"', false))
+      .toMatchInlineSnapshot(`
+      "const react = ((m, n) => n || !m?.__esModule ? {	...typeof m === "object" && !Array.isArray(m) || typeof m === "function" ? m : {},	default: m} : m)(__vite__cjsImport0_react, 0);
+       import __vite__cjsImport0_react from "./node_modules/.vite/deps/react.js""
+    `)
+    expect(runTransformCjsImport('import * as react from "react"', true))
+      .toMatchInlineSnapshot(`
+        "const react = ((m, n) => n || !m?.__esModule ? {	...typeof m === "object" && !Array.isArray(m) || typeof m === "function" ? m : {},	default: m} : m)(__vite__cjsImport0_react, 1);
+         import __vite__cjsImport0_react from "./node_modules/.vite/deps/react.js""
+      `)
   })
 
   test('export all specifier', () => {
-    expect(transformCjsImport('export * from "react"', url, rawUrl, 0)).toBe(
-      undefined
+    expect(
+      runTransformCjsImport('export * from "react"', false),
+    ).toMatchInlineSnapshot(`undefined`)
+    expect(
+      runTransformCjsImport('export * from "react"', true),
+    ).toMatchInlineSnapshot(`undefined`)
+
+    expect(config.logger.warn).toBeCalledWith(
+      expect.stringContaining(`export * from "react"\` in modA`),
     )
 
     expect(
-      transformCjsImport('export * as react from "react"', url, rawUrl, 0)
-    ).toBe(undefined)
+      runTransformCjsImport('export * as react from "react"', false),
+    ).toMatchInlineSnapshot(`undefined`)
+
+    expect(config.logger.warn).toBeCalledTimes(2)
   })
 
   test('export name specifier', () => {
     expect(
-      transformCjsImport(
-        'export { useState, Component } from "react"',
-        url,
-        rawUrl,
-        0
-      )
-    ).toBe(
-      'import __vite__cjsImport0_react from "./node_modules/.vite/react.js"; ' +
-        'const useState = __vite__cjsImport0_react["useState"]; ' +
-        'const Component = __vite__cjsImport0_react["Component"]; ' +
-        'export { useState, Component }'
-    )
+      runTransformCjsImport(
+        'export { useState, Component, "👋" } from "react"',
+        false,
+      ),
+    ).toMatchInlineSnapshot(`
+      "const __vite__cjsExportI_useState = __vite__cjsImport0_react["useState"];
+       const __vite__cjsExportI_Component = __vite__cjsImport0_react["Component"];
+       const __vite__cjsExportL_1d0452e3 = __vite__cjsImport0_react["👋"];
+       export { __vite__cjsExportI_useState as useState, __vite__cjsExportI_Component as Component, __vite__cjsExportL_1d0452e3 as "👋" };
+       import __vite__cjsImport0_react from "./node_modules/.vite/deps/react.js""
+    `)
+    expect(
+      runTransformCjsImport(
+        'export { useState, Component, "👋" } from "react"',
+        true,
+      ),
+    ).toMatchInlineSnapshot(`
+      "const __vite__cjsExportI_useState = __vite__cjsImport0_react["useState"];
+       const __vite__cjsExportI_Component = __vite__cjsImport0_react["Component"];
+       const __vite__cjsExportL_1d0452e3 = __vite__cjsImport0_react["👋"];
+       export { __vite__cjsExportI_useState as useState, __vite__cjsExportI_Component as Component, __vite__cjsExportL_1d0452e3 as "👋" };
+       import __vite__cjsImport0_react from "./node_modules/.vite/deps/react.js""
+    `)
 
     expect(
-      transformCjsImport(
-        'export { useState as useStateAlias, Component as ComponentAlias } from "react"',
-        url,
-        rawUrl,
-        0
-      )
-    ).toBe(
-      'import __vite__cjsImport0_react from "./node_modules/.vite/react.js"; ' +
-        'const useStateAlias = __vite__cjsImport0_react["useState"]; ' +
-        'const ComponentAlias = __vite__cjsImport0_react["Component"]; ' +
-        'export { useStateAlias, ComponentAlias }'
-    )
+      runTransformCjsImport(
+        'export { useState as useStateAlias, Component as ComponentAlias, "👋" as "👍" } from "react"',
+        false,
+      ),
+    ).toMatchInlineSnapshot(`
+      "const __vite__cjsExportI_useStateAlias = __vite__cjsImport0_react["useState"];
+       const __vite__cjsExportI_ComponentAlias = __vite__cjsImport0_react["Component"];
+       const __vite__cjsExportL_5d57d39e = __vite__cjsImport0_react["👋"];
+       export { __vite__cjsExportI_useStateAlias as useStateAlias, __vite__cjsExportI_ComponentAlias as ComponentAlias, __vite__cjsExportL_5d57d39e as "👍" };
+       import __vite__cjsImport0_react from "./node_modules/.vite/deps/react.js""
+    `)
   })
 
   test('export default specifier', () => {
-    expect(
-      transformCjsImport('export { default } from "react"', url, rawUrl, 0)
-    ).toBe(
-      'import __vite__cjsImport0_react from "./node_modules/.vite/react.js"; ' +
-        'const __vite__cjsExportDefault_0 = __vite__cjsImport0_react.__esModule ? __vite__cjsImport0_react.default : __vite__cjsImport0_react; ' +
-        'export default __vite__cjsExportDefault_0'
-    )
+    expect(runTransformCjsImport('export { default } from "react"', false))
+      .toMatchInlineSnapshot(`
+      "const __vite__cjsExportDefault_0 = !__vite__cjsImport0_react.__esModule ? __vite__cjsImport0_react : __vite__cjsImport0_react.default;
+       export default __vite__cjsExportDefault_0;
+       import __vite__cjsImport0_react from "./node_modules/.vite/deps/react.js""
+    `)
+    expect(runTransformCjsImport('export { default } from "react"', true))
+      .toMatchInlineSnapshot(`
+        "const __vite__cjsExportDefault_0 = __vite__cjsImport0_react;
+         export default __vite__cjsExportDefault_0;
+         import __vite__cjsImport0_react from "./node_modules/.vite/deps/react.js""
+      `)
 
     expect(
-      transformCjsImport(
-        'export { default as React} from "react"',
-        url,
-        rawUrl,
-        0
-      )
-    ).toBe(
-      'import __vite__cjsImport0_react from "./node_modules/.vite/react.js"; ' +
-        'const React = __vite__cjsImport0_react.__esModule ? __vite__cjsImport0_react.default : __vite__cjsImport0_react; ' +
-        'export { React }'
-    )
+      runTransformCjsImport('export { default as React} from "react"', false),
+    ).toMatchInlineSnapshot(`
+      "const __vite__cjsExportI_React = !__vite__cjsImport0_react.__esModule ? __vite__cjsImport0_react : __vite__cjsImport0_react.default;
+       export { __vite__cjsExportI_React as React };
+       import __vite__cjsImport0_react from "./node_modules/.vite/deps/react.js""
+    `)
 
     expect(
-      transformCjsImport(
+      runTransformCjsImport(
         'export { Component as default } from "react"',
-        url,
-        rawUrl,
-        0
-      )
-    ).toBe(
-      'import __vite__cjsImport0_react from "./node_modules/.vite/react.js"; ' +
-        'const __vite__cjsExportDefault_0 = __vite__cjsImport0_react["Component"]; ' +
-        'export default __vite__cjsExportDefault_0'
-    )
+        false,
+      ),
+    ).toMatchInlineSnapshot(`
+      "const __vite__cjsExportDefault_0 = __vite__cjsImport0_react["Component"];
+       export default __vite__cjsExportDefault_0;
+       import __vite__cjsImport0_react from "./node_modules/.vite/deps/react.js""
+    `)
   })
 })

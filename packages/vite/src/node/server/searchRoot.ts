@@ -1,21 +1,23 @@
-import fs from 'fs'
-import { dirname } from 'path'
-import { join } from 'path'
+import fs from 'node:fs'
+import { dirname, join } from 'node:path'
 import { isFileReadable } from '../utils'
 
 // https://github.com/vitejs/vite/issues/2820#issuecomment-812495079
 const ROOT_FILES = [
   // '.git',
 
-  // https://pnpm.js.org/workspaces/
-  'pnpm-workspace.yaml'
+  // https://pnpm.io/workspaces/
+  'pnpm-workspace.yaml',
 
   // https://rushjs.io/pages/advanced/config_files/
   // 'rush.json',
 
   // https://nx.dev/latest/react/getting-started/nx-setup
   // 'workspace.json',
-  // 'nx.json'
+  // 'nx.json',
+
+  // https://github.com/lerna/lerna#lernajson
+  'lerna.json',
 ]
 
 // npm: https://docs.npmjs.com/cli/v7/using-npm/workspaces#installing-workspaces
@@ -25,8 +27,30 @@ function hasWorkspacePackageJSON(root: string): boolean {
   if (!isFileReadable(path)) {
     return false
   }
-  const content = JSON.parse(fs.readFileSync(path, 'utf-8')) || {}
-  return !!content.workspaces
+  try {
+    const content = JSON.parse(fs.readFileSync(path, 'utf-8')) || {}
+    return !!content.workspaces
+  } catch {
+    return false
+  }
+}
+
+// https://docs.deno.com/runtime/fundamentals/workspaces/
+function hasWorkspaceDenoJSON(root: string): boolean {
+  for (const name of ['deno.json', 'deno.jsonc']) {
+    const path = join(root, name)
+    if (!isFileReadable(path)) {
+      continue
+    }
+    try {
+      const content = JSON.parse(fs.readFileSync(path, 'utf-8')) || {}
+      if (content.workspace) return true
+    } catch {
+      // deno.jsonc is only detected when it is also valid JSON. Full
+      // JSONC parsing would require an additional parser.
+    }
+  }
+  return false
 }
 
 function hasRootFile(root: string): boolean {
@@ -41,7 +65,10 @@ function hasPackageJSON(root: string) {
 /**
  * Search up for the nearest `package.json`
  */
-export function searchForPackageRoot(current: string, root = current): string {
+export function searchForPackageRoot(
+  current: string,
+  root: string = current,
+): string {
   if (hasPackageJSON(current)) return current
 
   const dir = dirname(current)
@@ -56,10 +83,11 @@ export function searchForPackageRoot(current: string, root = current): string {
  */
 export function searchForWorkspaceRoot(
   current: string,
-  root = searchForPackageRoot(current)
+  root: string = searchForPackageRoot(current),
 ): string {
   if (hasRootFile(current)) return current
   if (hasWorkspacePackageJSON(current)) return current
+  if (hasWorkspaceDenoJSON(current)) return current
 
   const dir = dirname(current)
   // reach the fs root

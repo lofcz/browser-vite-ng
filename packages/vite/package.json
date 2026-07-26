@@ -1,9 +1,18 @@
 {
   "name": "browser-vite",
-  "version": "6.0.0-browser.1",
+  "version": "8.1.5-browser.1",
   "license": "MIT",
   "author": "Evan You",
-  "description": "Native-ESM powered web dev build tool - Browser Edition",
+  "description": "Native-ESM powered web dev build tool - Browser Edition (Vite 8.1.5)",
+  "keywords": [
+    "build-tool",
+    "dev-server",
+    "framework",
+    "frontend",
+    "hmr",
+    "vite",
+    "browser"
+  ],
   "bin": {
     "vite": "bin/vite.js"
   },
@@ -11,133 +20,106 @@
   "browser": "dist/browser/index.js",
   "types": "dist/node/index.d.ts",
   "type": "module",
+  "imports": {
+    "#module-sync-enabled": {
+      "module-sync": "./misc/true.js",
+      "default": "./misc/false.js"
+    },
+    "#types/*": "./types/*.d.ts",
+    "#dep-types/*": "./src/types/*.d.ts"
+  },
   "exports": {
     ".": {
       "browser": "./dist/browser/index.js",
-      "node": "./dist/node/index.js",
-      "types": "./dist/node/index.d.ts"
+      "import": "./dist/node/index.js",
+      "types": "./dist/node/index.d.ts",
+      "default": "./dist/node/index.js"
+    },
+    "./browser": {
+      "import": "./dist/browser/index.js",
+      "types": "./dist/browser/index.d.ts",
+      "default": "./dist/browser/index.js"
     },
     "./client": {
       "types": "./client.d.ts"
-    }
+    },
+    "./module-runner": "./dist/node/module-runner.js",
+    "./internal": "./dist/node/internal.js",
+    "./dist/client/*": "./dist/client/*",
+    "./dist/browser/*": "./dist/browser/*",
+    "./types/*": {
+      "types": "./types/*"
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "bin",
     "dist",
+    "misc/**/*.js",
     "client.d.ts",
-    "src/client",
     "types"
   ],
   "engines": {
-    "node": ">=18.0.0"
+    "node": "^20.19.0 || >=22.12.0"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/BLamy/browser-vite.git",
+    "url": "git+https://github.com/BLamy/browser-vite-6.git",
     "directory": "packages/vite"
   },
   "bugs": {
-    "url": "https://github.com/BLamy/browser-vite/issues"
+    "url": "https://github.com/BLamy/browser-vite-6/issues"
   },
-  "homepage": "https://github.com/BLamy/browser-vite#readme",
+  "homepage": "https://github.com/BLamy/browser-vite-6#readme",
   "scripts": {
-    "dev": "rimraf dist && rollup -c -w",
-    "build": "rimraf dist && npm run lint && run-s build-bundle build-types",
-    "build-bundle": "rollup -c",
-    "build-types": "run-s build-browser-types build-temp-types patch-types roll-types",
-    "build-temp-types": "tsc --emitDeclarationOnly --outDir temp/node -p src/node",
-    "build-browser-types": "tsc --emitDeclarationOnly --outDir temp -p src/browser",
-    "ci-build": "rimraf dist && run-s build-bundle build-types",
-    "patch-types": "node scripts/patchTypes.cjs",
-    "roll-types": "cp -R temp/* dist/ && rimraf temp",
-    "lint": "eslint --ext .ts src/**",
-    "format": "prettier --write --parser typescript \"src/**/*.ts\"",
-    "changelog": "conventional-changelog -p angular -i CHANGELOG.md -s --commit-path .",
-    "release": "node ../../scripts/release.cjs"
-  },
-  "//": "READ CONTRIBUTING.md to understand what to put under deps vs. devDeps!",
-  "optionalDependencies": {
-    "fsevents": "~2.3.2"
+    "dev": "premove dist && pnpm build-bundle -w",
+    "build": "premove dist && pnpm build-bundle && pnpm build-browser && pnpm build-types",
+    "build-bundle": "rolldown --config rolldown.config.ts",
+    "build-browser": "rolldown --config rolldown.config.browser.ts",
+    "build-types": "pnpm build-types-roll && pnpm build-types-check",
+    "build-types-roll": "rolldown --config rolldown.dts.config.ts",
+    "build-types-check": "tsc --project tsconfig.check.json",
+    "ci-build": "premove dist && pnpm build-bundle && pnpm build-browser",
+    "typecheck": "tsc && tsc -p src/node && tsc -p src/client && tsc -p src/module-runner && tsc -p src/shared",
+    "lint": "eslint --cache --ext .ts src/**",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "esbuild": "^0.24.0",
-    "postcss": "^8.5.0",
-    "resolve": "^1.22.8",
-    "rollup": "^4.28.0",
-    "@ampproject/remapping": "^2.3.0",
-    "@babel/parser": "^7.26.0",
-    "@babel/types": "^7.26.0",
-    "@rollup/plugin-alias": "^5.1.0",
-    "@rollup/plugin-commonjs": "^28.0.0",
-    "@rollup/plugin-dynamic-import-vars": "^2.1.0",
-    "@rollup/plugin-json": "^6.1.0",
-    "@rollup/plugin-node-resolve": "^15.3.0",
-    "@rollup/plugin-replace": "^6.0.0",
-    "@rollup/plugin-typescript": "^12.1.0",
-    "@rollup/pluginutils": "^5.1.0",
-    "@vue/compiler-dom": "^3.5.0",
-    "acorn": "^8.14.0",
-    "cac": "^6.7.14",
-    "chalk": "^5.3.0",
-    "chokidar": "^3.6.0",
-    "cjs-module-lexer": "^1.4.0",
-    "clean-css": "^5.3.3",
-    "compression": "^1.7.4",
-    "connect": "^3.7.0",
-    "connect-history-api-fallback": "^2.0.0",
-    "convert-source-map": "^2.0.0",
-    "cors": "^2.8.5",
-    "debug": "^4.3.7",
-    "dotenv": "^16.4.0",
-    "dotenv-expand": "^12.0.0",
-    "es-module-lexer": "^1.5.0",
-    "estree-walker": "^2.0.2",
-    "etag": "^1.8.1",
-    "execa": "^5.1.1",
-    "http-proxy": "^1.18.1",
-    "launch-editor-middleware": "^2.9.0",
-    "magic-string": "^0.30.0",
-    "micromatch": "^4.0.8",
-    "mime": "^3.0.0",
-    "open": "^8.4.2",
-    "periscopic": "^3.1.0",
-    "picocolors": "^1.1.0",
-    "postcss-import": "^16.1.0",
-    "postcss-load-config": "^4.0.2",
-    "postcss-modules": "^6.0.0",
-    "resolve.exports": "^2.0.2",
-    "rollup-plugin-license": "^3.5.0",
-    "selfsigned": "^2.4.1",
-    "sirv": "^2.0.4",
-    "source-map-support": "^0.5.21",
-    "strip-ansi": "^6.0.1",
-    "terser": "^5.36.0",
-    "tinyglobby": "^0.2.0",
-    "tsconfck": "^3.1.0",
-    "tslib": "^2.8.0",
-    "ws": "^8.18.0"
+    "es-module-lexer": "^2.3.1",
+    "lightningcss": "^1.32.0",
+    "oxc-transform": "^0.108.0",
+    "picomatch": "^4.0.5",
+    "postcss": "^8.5.17",
+    "rolldown": "~1.1.5",
+    "tinyglobby": "^0.2.17"
   },
   "devDependencies": {
-    "@types/convert-source-map": "^2.0.3",
-    "@types/debug": "^4.1.12",
-    "@types/estree": "^1.0.6",
-    "@types/etag": "^1.8.3",
-    "@types/less": "^3.0.6",
-    "@types/micromatch": "^4.0.9",
-    "@types/mime": "^4.0.0",
+    "@oxc-transform/binding-wasm32-wasi": "^0.108.0",
     "@types/node": "^22.10.0",
-    "@types/resolve": "^1.20.6",
-    "@types/sass": "^1.45.0",
-    "@types/stylus": "^0.48.43",
-    "@types/ws": "^8.5.13"
+    "premove": "^4.0.0",
+    "typescript": "^5.8.0"
   },
   "peerDependencies": {
-    "less": "*",
-    "sass": "*",
-    "stylus": "*"
+    "@types/node": "^20.19.0 || >=22.12.0",
+    "esbuild": "^0.27.0 || ^0.28.0",
+    "less": "^4.0.0",
+    "sass": "^1.70.0",
+    "sass-embedded": "^1.70.0",
+    "stylus": ">=0.54.8",
+    "sugarss": "^5.0.0",
+    "terser": "^5.16.0"
   },
   "peerDependenciesMeta": {
+    "@types/node": {
+      "optional": true
+    },
+    "esbuild": {
+      "optional": true
+    },
     "sass": {
+      "optional": true
+    },
+    "sass-embedded": {
       "optional": true
     },
     "stylus": {
@@ -145,6 +127,16 @@
     },
     "less": {
       "optional": true
+    },
+    "sugarss": {
+      "optional": true
+    },
+    "terser": {
+      "optional": true
     }
-  }
+  },
+  "optionalDependencies": {
+    "fsevents": "~2.3.3"
+  },
+  "//": "UPSTREAM_VITE_VERSION=8.1.5 — see docs/UPSTREAM.md for bump process"
 }

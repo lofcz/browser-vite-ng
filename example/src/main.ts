@@ -16,6 +16,21 @@ import { css } from '@codemirror/lang-css';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { EditorState } from '@codemirror/state';
 import { BrowserVite } from './browser-vite-wrapper';
+import { createViteHmrIframeHtml, type HotPayload } from './hmr-bridge';
+import { readVirtualFile } from 'browser-vite';
+import { installDependencies } from './installer';
+import { bundleDeps, defaultEntrySpecifiers } from './dep-bundler';
+import { depCacheKey, loadDepCache, saveDepCache } from './dep-cache';
+// es-module-lexer@2.3.1 ESM source (incl. base64 WASM) served to the iframe so
+// it can tokenize import specifiers with exact indices instead of regex.
+import esModuleLexerSrc from './vendor/es-module-lexer.js?raw';
+// Precompiled iframe runtime + /@vite/client module (built by the
+// iframe-runtime Vite plugin at build/dev time — no runtime Oxc needed).
+import {
+  iframeRuntimeJs,
+  iframeClientJs,
+  reactRefreshJs,
+} from 'virtual:iframe-runtime';
 
 // =============================================================================
 // Virtual File System
@@ -61,11 +76,18 @@ export default function App() {
     type: 'tsx',
     content: `// Counter Component
 import React, { useState } from 'react';
+import { Plus, Minus, RotateCcw } from 'lucide-react';
 import { Button } from './components/Button';
 
 interface CounterProps {
   initialCount: number;
 }
+
+const iconStyle: React.CSSProperties = {
+  display: 'inline-block',
+  verticalAlign: 'middle',
+  marginRight: '6px',
+};
 
 export function Counter({ initialCount }: CounterProps) {
   const [count, setCount] = useState(initialCount);
@@ -76,12 +98,15 @@ export function Counter({ initialCount }: CounterProps) {
         {count}
       </div>
       <Button onClick={() => setCount(c => c + 1)} primary>
+        <Plus size={16} style={iconStyle} />
         Increment
       </Button>
       <Button onClick={() => setCount(c => c - 1)}>
+        <Minus size={16} style={iconStyle} />
         Decrement
       </Button>
       <Button onClick={() => setCount(initialCount)}>
+        <RotateCcw size={16} style={iconStyle} />
         Reset
       </Button>
     </div>
@@ -211,6 +236,22 @@ button:active {
 }
 `,
   },
+  {
+    path: '/package.json',
+    type: 'json',
+    content: `{
+  "name": "browser-vite-demo",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "lucide-react": "^1.27.0"
+  }
+}
+`,
+  },
 ];
 
 // Virtual file system state
@@ -234,7 +275,10 @@ function initFileSystem() {
 const statusEl = document.getElementById('status')!;
 const editorContainer = document.getElementById('editor')!;
 const previewFrame = document.getElementById('preview') as HTMLIFrameElement;
+const installConsoleEl = document.getElementById('installConsole')!;
 const runBtn = document.getElementById('runCode') as HTMLButtonElement;
+const installBtn = document.getElementById('installDeps') as HTMLButtonElement;
+const depsStatusEl = document.getElementById('depsStatus')!;
 const autoRunCheckbox = document.getElementById('autoRun') as HTMLInputElement;
 const fileTreeEl = document.getElementById('fileTree')!;
 const currentFileNameEl = document.getElementById('currentFileName')!;
@@ -267,6 +311,85 @@ function setStatus(message: string, type: 'success' | 'error' | 'pending') {
     pending: 'bg-amber-900/50 border-amber-700',
   };
   statusEl.className = `px-3 py-1.5 rounded font-mono text-xs border ${statusStyles[type]}`;
+}
+
+// =============================================================================
+// Install Console (preview-pane progress during dependency install)
+// =============================================================================
+
+const installConsoleStyles: Record<string, string> = {
+  info: 'text-[#c9d1d9]',
+  success: 'text-[#3fb950]',
+  error: 'text-[#f85149]',
+  warn: 'text-[#d29922]',
+  dim: 'text-[#8b949e]',
+};
+
+/** Show the console overlay in the preview pane, optionally clearing it. */
+function showInstallConsole(clear = true) {
+  if (clear) installConsoleEl.innerHTML = '';
+  installProgressLine = null;
+  installConsoleEl.classList.remove('hidden');
+}
+
+/** Hide the console overlay, revealing the preview iframe again. */
+function hideInstallConsole() {
+  installConsoleEl.classList.add('hidden');
+}
+
+/** Append a line to the install console (ANSI-style colored, autoscrolls). */
+function installLog(message: string, kind: keyof typeof installConsoleStyles = 'info') {
+  flushInstallProgress();
+  // Finalize any in-place progress line: overwrite it with the completed
+  // message instead of appending a new line (progress → result on one line).
+  if (installProgressLine) {
+    installProgressLine.className = installConsoleStyles[kind];
+    installProgressLine.textContent = message;
+    installProgressLine = null;
+    installConsoleEl.scrollTop = installConsoleEl.scrollHeight;
+    return;
+  }
+  const line = document.createElement('div');
+  line.className = installConsoleStyles[kind];
+  line.textContent = message;
+  installConsoleEl.appendChild(line);
+  installConsoleEl.scrollTop = installConsoleEl.scrollHeight;
+}
+
+let installProgressLine: HTMLDivElement | null = null;
+let pendingProgress: string | null = null;
+let progressRaf = 0;
+
+/**
+ * Update the in-place progress line (like a package-manager spinner). DOM
+ * writes are coalesced to one per animation frame so thousands of install /
+ * bundle events per second never force layout — this keeps install fast.
+ */
+function installProgress(message: string) {
+  pendingProgress = message;
+  if (progressRaf) return;
+  progressRaf = requestAnimationFrame(() => {
+    progressRaf = 0;
+    if (pendingProgress === null) return;
+    const text = pendingProgress;
+    pendingProgress = null;
+    if (!installProgressLine) {
+      installProgressLine = document.createElement('div');
+      installProgressLine.className = installConsoleStyles.dim;
+      installConsoleEl.appendChild(installProgressLine);
+    }
+    installProgressLine.textContent = text;
+    installConsoleEl.scrollTop = installConsoleEl.scrollHeight;
+  });
+}
+
+/** Flush any queued progress synchronously (before finalizing a line). */
+function flushInstallProgress() {
+  if (progressRaf) {
+    cancelAnimationFrame(progressRaf);
+    progressRaf = 0;
+  }
+  pendingProgress = null;
 }
 
 // =============================================================================
@@ -437,409 +560,129 @@ function openFile(path: string) {
 }
 
 // =============================================================================
-// Module Resolution & Bundling
+// Module serving (real ESM via BrowserServer; no regex bundling / eval)
 // =============================================================================
 
-function resolveImport(importPath: string, fromFile: string): string | null {
-  // Handle relative imports
-  if (importPath.startsWith('./') || importPath.startsWith('../')) {
-    const fromDir = fromFile.substring(0, fromFile.lastIndexOf('/'));
-    let resolved = fromDir + '/' + importPath.replace(/^\.\//, '');
-
-    // Normalize path (handle ../)
-    const parts = resolved.split('/').filter(Boolean);
-    const normalized: string[] = [];
-    for (const part of parts) {
-      if (part === '..') {
-        normalized.pop();
-      } else if (part !== '.') {
-        normalized.push(part);
-      }
-    }
-    resolved = '/' + normalized.join('/');
-
-    // Try extensions
-    const extensions = ['.tsx', '.ts', '.js', '.jsx'];
-    for (const ext of extensions) {
-      if (fileSystem.has(resolved + ext)) {
-        return resolved + ext;
-      }
-    }
-    // Try index files
-    for (const ext of extensions) {
-      if (fileSystem.has(resolved + '/index' + ext)) {
-        return resolved + '/index' + ext;
-      }
-    }
-    // Already has extension
-    if (fileSystem.has(resolved)) {
-      return resolved;
-    }
-  }
-
-  return null;
-}
-
-async function bundleAllModules(): Promise<string> {
+/**
+ * Transform the entry and all VFS files through the real dev pipeline
+ * (oxc → import-analysis → ModuleGraph) so the preview can import them as
+ * native ESM. Returns the entry URL to hand to the iframe bootstrap.
+ */
+async function prepareModules(entry: string): Promise<string> {
   if (!browserVite) throw new Error('BrowserVite not initialized');
-
-  const modules: Map<string, string> = new Map();
-  const processed = new Set<string>();
-
-  // Process a module and its dependencies
-  async function processModule(path: string) {
-    if (processed.has(path)) return;
-    processed.add(path);
-
-    const file = fileSystem.get(path);
-    if (!file) return;
-
-    // Skip CSS for now (handled separately)
-    if (file.type === 'css') return;
-
-    // Transform the code
-    const result = await browserVite!.transform(file.content, path);
-    let code = result.code;
-
-    // Find and process imports
-    const importRegex = /import\s+(?:(?:\{[^}]*\}|\*\s+as\s+\w+|\w+)\s*,?\s*)*\s*from\s+['"]([^'"]+)['"]/g;
-    let match;
-    const imports: string[] = [];
-
-    while ((match = importRegex.exec(code)) !== null) {
-      const importPath = match[1];
-      if (!importPath.startsWith('.')) continue; // Skip external modules
-
-      const resolved = resolveImport(importPath, path);
-      if (resolved) {
-        imports.push(resolved);
-        await processModule(resolved);
-      }
-    }
-
-    modules.set(path, code);
-  }
-
-  // Start from App.tsx
-  await processModule('/src/App.tsx');
-
-  // Build the bundle
-  let bundle = '';
-
-  // Add module registry
-  bundle += `
-const __modules = {};
-const __exports = {};
-
-function __require(id) {
-  if (__exports[id]) return __exports[id];
-  __exports[id] = {};
-  __modules[id](__require);
-  return __exports[id];
-}
-
-`;
-
-  // Process each module
-  for (const [path, code] of modules) {
-    let processedCode = code;
-
-    // Replace React imports with globals
-    processedCode = processedCode.replace(
-      /import\s+React\s*,\s*\{([^}]+)\}\s+from\s+['"]react['"];?/g,
-      (_, imports) => {
-        const vars = imports
-          .split(',')
-          .map((i: string) => i.trim())
-          .filter(Boolean);
-        return `const React = window.React;\n${vars.map((v: string) => `const ${v} = React.${v};`).join('\n')}`;
-      }
-    );
-    processedCode = processedCode.replace(
-      /import\s+React\s+from\s+['"]react['"];?/g,
-      'const React = window.React;'
-    );
-    processedCode = processedCode.replace(
-      /import\s+\{([^}]+)\}\s+from\s+['"]react['"];?/g,
-      (_, imports) => {
-        const vars = imports
-          .split(',')
-          .map((i: string) => i.trim())
-          .filter(Boolean);
-        return vars.map((v: string) => `const ${v} = React.${v};`).join('\n');
-      }
-    );
-
-    // Replace relative imports with __require calls
-    processedCode = processedCode.replace(
-      /import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]/g,
-      (_, imports, importPath) => {
-        const resolved = resolveImport(importPath, path);
-        if (resolved) {
-          const vars = imports
-            .split(',')
-            .map((i: string) => i.trim())
-            .filter(Boolean);
-          return `const { ${vars.join(', ')} } = __require('${resolved}')`;
-        }
-        return '';
-      }
-    );
-
-    // Handle default imports
-    processedCode = processedCode.replace(
-      /import\s+(\w+)\s+from\s+['"]([^'"]+)['"]/g,
-      (_, name, importPath) => {
-        const resolved = resolveImport(importPath, path);
-        if (resolved) {
-          return `const ${name} = __require('${resolved}').default`;
-        }
-        return '';
-      }
-    );
-
-    // Convert exports
-    processedCode = processedCode.replace(/export\s+default\s+function\s+(\w+)/g, 'function $1');
-    processedCode = processedCode.replace(
-      /export\s+default\s+/g,
-      '__exports[__currentModule].default = '
-    );
-    processedCode = processedCode.replace(
-      /export\s+function\s+(\w+)/g,
-      '__exports[__currentModule].$1 = function $1'
-    );
-    processedCode = processedCode.replace(
-      /export\s+const\s+(\w+)/g,
-      '__exports[__currentModule].$1 = '
-    );
-    processedCode = processedCode.replace(/export\s+\{[^}]*\};?/g, '');
-
-    // Check for default function that needs assignment
-    const funcMatch = code.match(/export\s+default\s+function\s+(\w+)/);
-    if (funcMatch) {
-      processedCode += `\n__exports[__currentModule].default = ${funcMatch[1]};`;
-    }
-
-    bundle += `
-__modules['${path}'] = function(__require) {
-  const __currentModule = '${path}';
-${processedCode
-  .split('\n')
-  .map((line) => '  ' + line)
-  .join('\n')}
-};
-`;
-  }
-
-  // Add entry point
-  bundle += `
-const App = __require('/src/App.tsx').default;
-`;
-
-  return bundle;
+  await syncFilesToBrowserVite();
+  // Warm the graph so import-analysis has rewritten every import specifier to
+  // a servable URL before the iframe starts importing.
+  await browserVite.transform(fileSystem.get(entry)?.content ?? '', entry);
+  return entry;
 }
 
 // =============================================================================
-// HMR Runtime
+// HMR Runtime (real Vite 8 client semantics, blob-URL ESM serving)
 // =============================================================================
 
+/**
+ * Preview iframe with Vite HotPayload client (full HMRClient semantics).
+ * Host sends { type: 'vite-hmr', payload } — same shapes as Vite 8 WebSocket.
+ */
 function createHMRRuntime(): string {
-  return `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-  <script src="https://unpkg.com/chobitsu"></script>
-  <style>
-    body { margin: 0; }
-    #root { min-height: 100vh; }
-    .hmr-error {
-      font-family: monospace;
-      background: #2d1b1b;
-      color: #ff6b6b;
-      padding: 20px;
-      margin: 0;
-      min-height: 100vh;
-      box-sizing: border-box;
-    }
-    .hmr-error pre { white-space: pre-wrap; word-wrap: break-word; }
-  </style>
-  <style id="hmr-styles"></style>
-</head>
-<body>
-  <div id="root"></div>
-  <script>
-    // HMR Runtime
-    let currentApp = null;
-    let reactRoot = null;
-    let updateCount = 0;
+  // Precompiled modules (plain JS). Blob-serve client + lexer, expose their
+  // URLs on window, then run the precompiled runtime module.
+  const clientBootstrap = `
+    window.__VITE_CLIENT_URL = URL.createObjectURL(new Blob([${JSON.stringify(iframeClientJs)}], { type: 'text/javascript' }));
+    window.__ES_MODULE_LEXER_URL = URL.createObjectURL(new Blob([${JSON.stringify(esModuleLexerSrc)}], { type: 'text/javascript' }));
+    window.__REACT_REFRESH_URL = URL.createObjectURL(new Blob([${JSON.stringify(reactRefreshJs)}], { type: 'text/javascript' }));
+${iframeRuntimeJs}
+  `;
 
-    function hmrLog(msg) {
-      window.parent.postMessage({ type: 'hmr-log', message: msg }, '*');
-    }
-
-    // Initialize Chobitsu CDP
-    function initChobitsu() {
-      if (typeof chobitsu === 'undefined') {
-        hmrLog('Chobitsu not loaded, skipping CDP initialization');
-        return;
-      }
-
-      // Set up message handler to forward CDP responses to parent
-      chobitsu.setOnMessage(function(message) {
-        window.parent.postMessage({
-          type: 'cdp-response',
-          message: message
-        }, '*');
-      });
-
-      hmrLog('Chobitsu CDP initialized');
-      window.parent.postMessage({ type: 'cdp-ready' }, '*');
-    }
-
-    function renderApp(AppComponent) {
-      try {
-        if (!reactRoot) {
-          reactRoot = ReactDOM.createRoot(document.getElementById('root'));
-          hmrLog('Created new React root');
-        }
-        reactRoot.render(React.createElement(AppComponent));
-        hmrLog('Rendered component (update #' + updateCount + ')');
-      } catch (err) {
-        hmrLog('Render error: ' + err.message);
-        document.getElementById('root').innerHTML =
-          '<div class="hmr-error"><h2>Render Error</h2><pre>' + err.message + '\\n' + err.stack + '</pre></div>';
-      }
-    }
-
-    function handleHMRUpdate(code, fileType) {
-      updateCount++;
-      hmrLog('Received HMR update #' + updateCount + ' for ' + fileType);
-
-      if (fileType === 'css') {
-        document.getElementById('hmr-styles').textContent = code;
-        hmrLog('CSS injected without reload');
-        return;
-      }
-
-      try {
-        hmrLog('Evaluating module bundle...');
-
-        const moduleCode = code + '\\nreturn typeof App !== "undefined" ? App : null;';
-        const AppComponent = new Function(moduleCode)();
-
-        if (AppComponent) {
-          currentApp = AppComponent;
-          renderApp(currentApp);
-          hmrLog('HMR update successful - component re-rendered');
-        } else {
-          new Function(code)();
-          hmrLog('Code executed (no App component found)');
-        }
-      } catch (err) {
-        hmrLog('HMR Error: ' + err.message);
-        document.getElementById('root').innerHTML =
-          '<div class="hmr-error"><h2>HMR Error</h2><pre>' + err.message + '\\n' + err.stack + '</pre></div>';
-      }
-    }
-
-    window.addEventListener('message', function(event) {
-      if (event.data && event.data.type === 'hmr-update') {
-        handleHMRUpdate(event.data.code, event.data.fileType);
-      }
-      // Handle CDP commands from parent
-      if (event.data && event.data.type === 'cdp-command') {
-        if (typeof chobitsu !== 'undefined') {
-          chobitsu.sendRawMessage(event.data.message);
-        }
-      }
-    });
-
-    window.parent.postMessage({ type: 'hmr-ready' }, '*');
-    hmrLog('HMR Runtime initialized');
-
-    // Initialize Chobitsu after a short delay to ensure it's loaded
-    setTimeout(initChobitsu, 100);
-  </script>
-</body>
-</html>`;
+  return createViteHmrIframeHtml(clientBootstrap);
 }
 
 // =============================================================================
 // Preview Update
 // =============================================================================
 
+/** Sync VFS → browserVite and ensure graph entries exist for all files. */
+async function syncFilesToBrowserVite() {
+  if (!browserVite) return;
+  for (const [path, file] of fileSystem) {
+    browserVite.setFile(path, file.content);
+  }
+  // Transform entry + deps so ModuleGraph edges / accept boundaries exist.
+  // Tolerate per-file transform errors: BrowserServer already broadcasts an
+  // `error` HotPayload for a failed transform, and a file currently in an
+  // error state must not abort the whole sync (that would prevent recovery
+  // when the file is later fixed).
+  for (const [path, file] of fileSystem) {
+    if (file.type === 'css' || file.type === 'ts' || file.type === 'tsx') {
+      try {
+        await browserVite.transform(file.content, path);
+      } catch {
+        // error payload already sent by the server; continue syncing others
+      }
+    }
+  }
+}
+
+/** Initial / full bootstrap: serve the entry as real ESM into the iframe. */
+async function bootstrapPreview() {
+  if (!browserVite || !iframeReady) return;
+  const entry = await prepareModules('/src/App.tsx');
+  previewFrame.contentWindow?.postMessage(
+    { type: 'hmr-update', entry, fileType: 'tsx' },
+    '*',
+  );
+  log('Bootstrap entry sent to iframe (real ESM serving)', 'hmr');
+}
+
+/**
+ * Full-fidelity HMR path: Vite updateModules / propagateUpdate → HotPayload.
+ */
 async function updatePreview() {
   if (!browserVite || !editor) {
     log('Cannot update: browserVite or editor not ready', 'warn');
     return;
   }
 
-  // Save current editor content
   if (currentFile) {
     const content = editor.state.doc.toString();
     const file = fileSystem.get(currentFile);
     if (file) {
       file.content = content;
     }
+    browserVite.setFile(currentFile, content);
+  }
+
+  // Non-code files (package.json etc.) aren't modules — skip the HMR pipeline.
+  // Dependency changes take effect via the Install button, which rebundles.
+  const currentType = getFileType(currentFile);
+  if (currentType === 'json') {
+    log('package.json changed — click Install to apply dependency changes', 'warn');
+    return;
   }
 
   updateCounter++;
   const updateId = updateCounter;
-
-  log(`Starting update #${updateId}`, 'hmr');
+  log(`Starting HMR update #${updateId} for ${currentFile}`, 'hmr');
 
   try {
-    const currentFileData = fileSystem.get(currentFile);
-    const fileType = currentFileData?.type || 'tsx';
-
-    let processedCode: string;
-
-    if (fileType === 'css') {
-      // For CSS, just send the content
-      const cssFiles = Array.from(fileSystem.values()).filter((f) => f.type === 'css');
-      processedCode = cssFiles.map((f) => f.content).join('\n');
-      log(`CSS update #${updateId}`, 'hmr');
-    } else {
-      // Bundle all modules
-      log(`Bundling modules...`, 'hmr');
-      const startTime = performance.now();
-      processedCode = await bundleAllModules();
-      const bundleTime = (performance.now() - startTime).toFixed(1);
-      log(`Bundle complete in ${bundleTime}ms (${processedCode.length} chars)`, 'hmr');
+    if (!iframeReady) {
+      log('Iframe not ready, queuing update...', 'warn');
+      return;
     }
 
-    // Send to iframe via postMessage
-    if (iframeReady) {
-      log(`Sending HMR update #${updateId} to iframe...`, 'hmr');
-      previewFrame.contentWindow?.postMessage(
-        {
-          type: 'hmr-update',
-          code: processedCode,
-          fileType: fileType,
-          updateId,
-        },
-        '*'
-      );
+    const content = fileSystem.get(currentFile)?.content ?? '';
+    // Ensure graph is warm, then run full Vite HMR pipeline
+    await syncFilesToBrowserVite();
+    const ok = await browserVite.handleHMRUpdate(currentFile, content);
+    if (ok) {
+      log(`handleHMRUpdate #${updateId} dispatched HotPayload(s)`, 'hmr');
     } else {
-      log('Iframe not ready, queuing update...', 'warn');
+      log(`handleHMRUpdate #${updateId} failed`, 'error');
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    log(`Bundle error: ${message}`, 'error');
-
-    if (iframeReady) {
-      previewFrame.contentWindow?.postMessage(
-        {
-          type: 'hmr-update',
-          code: `document.getElementById('root').innerHTML = '<div class="hmr-error"><h2>Bundle Error</h2><pre>${message.replace(/'/g, "\\'")}</pre></div>';`,
-          fileType: 'ts',
-          updateId,
-        },
-        '*'
-      );
-    }
+    log(`HMR error: ${message}`, 'error');
   }
 }
 
@@ -851,9 +694,6 @@ let cdpReady = false;
 let cdpMessageId = 0;
 const cdpCallbacks: Map<number, (result: any) => void> = new Map();
 const cdpEventListeners: Map<string, Set<(params: any) => void>> = new Map();
-
-// Forward declaration for DevTools CDP forwarding
-declare function forwardCDPToDevtools(message: string): void;
 
 // Send a CDP command to the iframe
 function sendCDPCommand(method: string, params: Record<string, any> = {}): Promise<any> {
@@ -922,22 +762,90 @@ function handleCDPResponse(message: string) {
 // Event Handlers
 // =============================================================================
 
-window.addEventListener('message', (event) => {
+window.addEventListener('message', async (event) => {
   if (event.data?.type === 'hmr-ready') {
     iframeReady = true;
     log('Iframe HMR runtime ready', 'hmr');
-    updatePreview();
+    // Initial paint via bootstrap bundle; subsequent edits use HotPayload HMR
+    await bootstrapPreview();
   } else if (event.data?.type === 'hmr-log') {
     log(`iframe: ${event.data.message}`, 'hmr');
+  } else if (event.data?.type === 'hmr-fetch-module') {
+    // Iframe asked for a fresh transformed module (real dev-server fetchModule).
+    try {
+      if (!browserVite) throw new Error('BrowserVite not ready');
+      const path = event.data.path as string;
+      // Well-known public paths served from precompiled bundles, not the VFS.
+      if (path === '/@react-refresh') {
+        previewFrame.contentWindow?.postMessage(
+          { type: 'hmr-module', id: event.data.id, code: reactRefreshJs },
+          '*',
+        );
+        return;
+      }
+      if (path === '/@vite/client') {
+        previewFrame.contentWindow?.postMessage(
+          { type: 'hmr-module', id: event.data.id, code: iframeClientJs },
+          '*',
+        );
+        return;
+      }
+      // Optimized deps: /@deps/<file>.js -> /node_modules/.deps/<file>.js (VFS).
+      if (path.startsWith('/@deps/')) {
+        const vfsPath = `/node_modules/.deps/${path.slice('/@deps/'.length)}`;
+        const code = readVirtualFile(vfsPath);
+        if (code === undefined) throw new Error(`Optimized dep not found: ${path}`);
+        previewFrame.contentWindow?.postMessage(
+          { type: 'hmr-module', id: event.data.id, code },
+          '*',
+        );
+        return;
+      }
+      const served = await browserVite.fetchModule(path);
+      if (!served) throw new Error(`No module for ${path}`);
+      if (event.data.css || path.endsWith('.css')) {
+        // CSS dev module self-injects via updateStyle; send raw css for the
+        // iframe's stylesheet swap as well.
+        previewFrame.contentWindow?.postMessage(
+          {
+            type: 'hmr-module',
+            id: event.data.id,
+            code: fileSystem.get(path)?.content ?? '',
+            css: true,
+          },
+          '*',
+        );
+      } else {
+        previewFrame.contentWindow?.postMessage(
+          { type: 'hmr-module', id: event.data.id, code: served.code },
+          '*',
+        );
+      }
+    } catch (err) {
+      previewFrame.contentWindow?.postMessage(
+        {
+          type: 'hmr-module',
+          id: event.data.id,
+          error: err instanceof Error ? err.message : String(err),
+        },
+        '*',
+      );
+    }
+  } else if (event.data?.type === 'hmr-full-reload-ack') {
+    log('Client acknowledged full-reload', 'hmr');
   } else if (event.data?.type === 'cdp-ready') {
     cdpReady = true;
     log('CDP (Chobitsu) ready - Click DevTools to open Chrome DevTools', 'success');
   } else if (event.data?.type === 'cdp-response') {
     handleCDPResponse(event.data.message);
-    // Forward CDP responses to DevTools iframe if open
     forwardCDPToDevtools(event.data.message);
   }
 });
+
+window.addEventListener('vite-hmr-payload', ((event: CustomEvent<HotPayload>) => {
+  const payload = event.detail;
+  log(`HotPayload → ${payload.type}`, 'hmr');
+}) as EventListener);
 
 function initIframe() {
   log('Initializing iframe with HMR runtime...', 'hmr');
@@ -945,6 +853,7 @@ function initIframe() {
   const html = createHMRRuntime();
   const blob = new Blob([html], { type: 'text/html' });
   previewFrame.src = URL.createObjectURL(blob);
+  browserVite?.setPreviewIframe(previewFrame);
 }
 
 function scheduleUpdate() {
@@ -1006,6 +915,76 @@ function createNewFile() {
 }
 
 // =============================================================================
+// Dependency Installation (npm registry -> VFS -> esbuild-wasm optimize)
+// =============================================================================
+
+let depsInstalled = false;
+let installing = false;
+
+/** Install deps from /package.json, bundle them, push manifest, reload preview. */
+async function runInstall(): Promise<boolean> {
+  if (!browserVite || installing) return depsInstalled;
+  installing = true;
+  installBtn.disabled = true;
+  depsStatusEl.textContent = 'installing…';
+  showInstallConsole(true);
+  installLog('$ browser-vite install', 'dim');
+  try {
+    const pkgJson = fileSystem.get('/package.json')?.content;
+    if (!pkgJson) throw new Error('No /package.json in the project');
+    const { installed, direct } = await installDependencies(
+      pkgJson,
+      (m) => {
+        installLog(m, 'info');
+        log(`[install] ${m}`);
+      },
+      (m) => installProgress(m),
+    );
+    const specifiers = defaultEntrySpecifiers(direct);
+    // Skip the expensive esbuild-wasm bundle when we've already bundled this
+    // exact resolved-version set (persisted in IndexedDB). The install above
+    // is still needed to know the resolved versions that key the cache.
+    const cacheKey = await depCacheKey(installed);
+    let manifest = await loadDepCache(cacheKey);
+    if (manifest) {
+      installLog('✓ using cached optimized deps (IndexedDB)', 'success');
+      log('[bundle] cache hit — skipped bundling', 'success');
+    } else {
+      const bundled = await bundleDeps(
+        specifiers,
+        (m) => {
+          installLog(m, 'dim');
+          log(`[bundle] ${m}`);
+        },
+        (m) => installProgress(m),
+      );
+      manifest = bundled.manifest;
+      void saveDepCache(cacheKey, bundled.manifest, bundled.files);
+    }
+    browserVite.setOptimizedDeps(manifest);
+    browserVite.clearModuleGraph();
+    depsInstalled = true;
+    depsStatusEl.textContent = `${installed.length} deps`;
+    installLog(`✓ installed ${installed.length} package(s), ${specifiers.length} optimized entrie(s)`, 'success');
+    log(`[install] Done — ${installed.length} package(s), ${specifiers.length} optimized entrie(s)`, 'success');
+    // Brief pause so the success line is visible before the preview takes over.
+    await new Promise((r) => setTimeout(r, 400));
+    hideInstallConsole();
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    depsStatusEl.textContent = 'install failed';
+    installLog(`✗ install failed: ${message}`, 'error');
+    installLog('Fix /package.json and click Install to retry.', 'warn');
+    log(`[install] Failed: ${message}`, 'error');
+    return false;
+  } finally {
+    installing = false;
+    installBtn.disabled = false;
+  }
+}
+
+// =============================================================================
 // Initialization
 // =============================================================================
 
@@ -1018,26 +997,49 @@ async function initialize() {
     initFileSystem();
     renderFileTree();
 
-    // Initialize browser-vite
+    // Initialize browser-vite (Oxc WASM + full Vite 8 HMR)
     browserVite = new BrowserVite();
     await browserVite.init();
+    browserVite.setPreviewIframe(previewFrame);
 
-    setStatus('Ready!', 'success');
-    log('Browser-vite ready!', 'success');
+    // Seed VFS into browser-vite
+    for (const [path, file] of fileSystem) {
+      browserVite.setFile(path, file.content);
+    }
 
     // Enable UI
     runBtn.disabled = false;
     autoRunCheckbox.disabled = false;
+    installBtn.disabled = false;
+    installBtn.addEventListener('click', () => {
+      void runInstall().then((ok) => {
+        if (ok) initIframe();
+      });
+    });
 
     // Open the main App file
     openFile('/src/App.tsx');
 
-    // Initialize iframe with HMR runtime
+    // Install dependencies (real npm registry -> VFS -> esbuild-wasm), then
+    // bring up the preview once the optimized deps manifest is available.
+    setStatus('Installing deps...', 'pending');
+    const installed = await runInstall();
+    if (!installed) {
+      setStatus('Install failed', 'error');
+      log('Dependency install failed — fix /package.json and click Install', 'error');
+      return;
+    }
+
+    setStatus('Ready!', 'success');
+    log('Browser-vite ready!', 'success');
+
+    // Initialize iframe with Vite HotPayload HMR client
     initIframe();
 
     // Expose for debugging and external use
     (window as any).browserVite = browserVite;
     (window as any).fileSystem = fileSystem;
+    (window as any).getEditor = () => editor;
 
     // Expose CDP API
     (window as any).cdp = {
@@ -1158,9 +1160,19 @@ window.addEventListener('message', handleDevtoolsMessage);
 devtoolsToggle.addEventListener('click', toggleDevtools);
 
 // Event listeners
-runBtn.addEventListener('click', () => {
+runBtn.addEventListener('click', async () => {
   log('Manual run triggered', 'info');
-  updatePreview();
+  // Persist the current editor buffer, then do a clean re-bootstrap. A manual
+  // Run is the user's explicit "render the current code now" — re-bootstrapping
+  // guarantees recovery from any prior HMR error state (stale overlay, poisoned
+  // module graph), where an incremental HMR update might silently no-op.
+  if (editor && currentFile) {
+    const file = fileSystem.get(currentFile);
+    if (file) file.content = editor.state.doc.toString();
+    browserVite?.setFile(currentFile, editor.state.doc.toString());
+  }
+  browserVite?.clearModuleGraph();
+  await bootstrapPreview();
 });
 
 newFileBtn.addEventListener('click', showNewFileModal);

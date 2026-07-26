@@ -14,3 +14,7 @@ explorations
 /packages/playground/ssr-deps/node-addon/build/
 playwright-report
 test-results
+# Vite upstream sync staging
+.vite-upstream-*/
+.browser-overlay-backup/
+

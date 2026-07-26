@@ -1,112 +1,176 @@
-import debug from 'debug'
-import chalk from 'chalk'
-import fs from 'fs'
-import os from 'os'
-import path from 'path'
-import { URL } from 'url'
+import fs from 'node:fs'
+import os from 'node:os'
+import net from 'node:net'
+import path from 'node:path'
+import { exec } from 'node:child_process'
+import crypto from 'node:crypto'
+import { fileURLToPath } from 'node:url'
+import type { ServerOptions as HttpsServerOptions } from 'node:https'
+import { builtinModules } from 'node:module'
+import { promises as dns } from 'node:dns'
+import { performance } from 'node:perf_hooks'
+import type { AddressInfo, Server } from 'node:net'
+import fsp from 'node:fs/promises'
+import remapping from '@jridgewell/remapping'
+import type { DecodedSourceMap, RawSourceMap } from '@jridgewell/remapping'
+import colors from 'picocolors'
+import type { Debugger } from 'obug'
+import debug from 'obug'
+import type MagicString from 'magic-string'
+import type { Equal } from '@type-challenges/utils'
+
+import type { TransformResult } from 'rolldown'
+import { createFilter as _createFilter } from '@rollup/pluginutils'
+import type { Alias, AliasOptions } from '#dep-types/alias'
+import type { FSWatcher } from '#dep-types/chokidar'
 import {
-  FS_PREFIX,
-  DEFAULT_EXTENSIONS,
-  VALID_ID_PREFIX,
+  cleanUrl,
+  isWindows,
+  slash,
+  splitFileAndPostfix,
+  withTrailingSlash,
+} from '../shared/utils'
+import { VALID_ID_PREFIX } from '../shared/constants'
+import { createIsBuiltin } from '../shared/builtin'
+import {
+  CLIENT_ENTRY,
   CLIENT_PUBLIC_PATH,
-  ENV_PUBLIC_PATH
+  CSS_LANGS_RE,
+  ENV_PUBLIC_PATH,
+  FS_PREFIX,
+  OPTIMIZABLE_ENTRY_RE,
+  loopbackHosts,
+  wildcardHosts,
 } from './constants'
-import resolve from 'resolve'
-import { builtinModules } from 'module'
-import { FSWatcher } from 'chokidar'
-import remapping from '@ampproject/remapping'
-import {
-  DecodedSourceMap,
-  RawSourceMap
-} from '@ampproject/remapping/dist/types/types'
-import { performance } from 'perf_hooks'
+import type { DepOptimizationOptions } from './optimizer'
+import type { ResolvedConfig } from './config'
+import type { ResolvedServerUrls, ServerOptions, ViteDevServer } from './server'
+import type { PreviewServer } from './preview'
+import { type PackageCache, findNearestPackageData } from './packages'
+import type { BuildEnvironmentOptions } from './build'
+import type { CommonServerOptions } from '.'
 
-export function slash(p: string): string {
-  return p.replace(/\\/g, '/')
+/**
+ * Inlined to keep `@rollup/pluginutils` in devDependencies
+ */
+export type FilterPattern =
+  | ReadonlyArray<string | RegExp>
+  | string
+  | RegExp
+  | null
+export const createFilter = _createFilter as (
+  include?: FilterPattern,
+  exclude?: FilterPattern,
+  options?: { resolve?: string | false | null },
+) => (id: unknown) => boolean
+
+export { withFilter } from 'rolldown/filter'
+
+// eslint-disable-next-line no-control-regex
+const invalidUrlPathCharRE = /[\u0000-\u001F"#$%&*+,:;<=>?[\]^`{|}\u007F]/g
+const replaceNestedIdRE = /\s*>\s*/g
+export const flattenId = (id: string): string => {
+  const flatId = limitFlattenIdLength(
+    id
+      .replaceAll(/_+/g, '$&__')
+      .replaceAll('/', '_')
+      .replaceAll('.', '__')
+      .replace(replaceNestedIdRE, '_n_')
+      // replace any characters that will be replaced by sanitizeFileName
+      .replace(
+        invalidUrlPathCharRE,
+        (c) => '_0' + c.charCodeAt(0).toString(16) + '_',
+      ),
+  )
+  return flatId
 }
 
-// Strip valid id prefix. This is prepended to resolved Ids that are
-// not valid browser import specifiers by the importAnalysis plugin.
-export function unwrapId(id: string): string {
-  return id.startsWith(VALID_ID_PREFIX) ? id.slice(VALID_ID_PREFIX.length) : id
-}
+const FLATTEN_ID_HASH_LENGTH = 8
+const FLATTEN_ID_MAX_FILE_LENGTH = 170
 
-export const flattenId = (id: string): string =>
-  id.replace(/(\s*>\s*)/g, '__').replace(/[\/\.]/g, '_')
+const limitFlattenIdLength = (
+  id: string,
+  limit: number = FLATTEN_ID_MAX_FILE_LENGTH,
+): string => {
+  if (id.length <= limit) {
+    return id
+  }
+  return id.slice(0, limit - (FLATTEN_ID_HASH_LENGTH + 1)) + '_' + getHash(id)
+}
 
 export const normalizeId = (id: string): string =>
-  id.replace(/(\s*>\s*)/g, ' > ')
+  id.replace(replaceNestedIdRE, ' > ')
 
-//TODO: revisit later to see if the edge case that "compiling using node v12 code to be run in node v16 in the server" is what we intend to support.
-const builtins = new Set([
-  ...builtinModules,
-  'assert/strict',
-  'diagnostics_channel',
-  'dns/promises',
-  'fs/promises',
-  'path/posix',
-  'path/win32',
-  'readline/promises',
-  'stream/consumers',
-  'stream/promises',
-  'stream/web',
-  'timers/promises',
-  'util/types',
-  'wasi'
-])
+// Supported by Node, Deno, Bun
+const NODE_BUILTIN_NAMESPACE = 'node:'
+// Supported by Bun
+const BUN_BUILTIN_NAMESPACE = 'bun:'
+// Some runtimes like Bun injects namespaced modules here, which is not a node builtin
+const nodeBuiltins = builtinModules.filter((id) => !id.includes(':'))
 
-export function isBuiltin(id: string): boolean {
-  return builtins.has(id.replace(/^node:/, ''))
+const isBuiltinCache = new WeakMap<
+  (string | RegExp)[],
+  (id: string, importer?: string) => boolean
+>()
+
+export function isBuiltin(builtins: (string | RegExp)[], id: string): boolean {
+  let isBuiltin = isBuiltinCache.get(builtins)
+  if (!isBuiltin) {
+    isBuiltin = createIsBuiltin(builtins)
+    isBuiltinCache.set(builtins, isBuiltin)
+  }
+  return isBuiltin(id)
+}
+
+export const nodeLikeBuiltins: (string | RegExp)[] = [
+  ...nodeBuiltins,
+  new RegExp(`^${NODE_BUILTIN_NAMESPACE}`),
+  new RegExp(`^${BUN_BUILTIN_NAMESPACE}`),
+]
+
+export function isNodeLikeBuiltin(id: string): boolean {
+  return isBuiltin(nodeLikeBuiltins, id)
+}
+
+export function isNodeBuiltin(id: string): boolean {
+  if (id.startsWith(NODE_BUILTIN_NAMESPACE)) return true
+  return nodeBuiltins.includes(id)
+}
+
+export function isInNodeModules(id: string): boolean {
+  return id.includes('node_modules')
 }
 
 export function moduleListContains(
   moduleList: string[] | undefined,
-  id: string
+  id: string,
 ): boolean | undefined {
-  return moduleList?.some((m) => m === id || id.startsWith(m + '/'))
+  return moduleList?.some(
+    (m) => m === id || id.startsWith(withTrailingSlash(m)),
+  )
 }
 
-export const bareImportRE = /^[\w@](?!.*:\/\/)/
-export const deepImportRE = /^([^@][^/]*)\/|^(@[^/]+\/[^/]+)\//
-
-export let isRunningWithYarnPnp: boolean
-try {
-  isRunningWithYarnPnp = Boolean(require('pnpapi'))
-} catch {}
-
-const ssrExtensions = ['.js', '.cjs', '.json', '.node']
-
-export function resolveFrom(
+export function isOptimizable(
   id: string,
-  basedir: string,
-  preserveSymlinks = false,
-  ssr = false
-): string {
-  return resolve.sync(id, {
-    basedir,
-    extensions: ssr ? ssrExtensions : DEFAULT_EXTENSIONS,
-    // necessary to work with pnpm
-    preserveSymlinks: preserveSymlinks || isRunningWithYarnPnp || false
-  })
+  optimizeDeps: DepOptimizationOptions,
+): boolean {
+  const { extensions } = optimizeDeps
+  return (
+    OPTIMIZABLE_ENTRY_RE.test(id) ||
+    (extensions?.some((ext) => id.endsWith(ext)) ?? false)
+  )
 }
 
-/**
- * like `resolveFrom` but supports resolving `>` path in `id`,
- * for example: `foo > bar > baz`
- */
-export function nestedResolveFrom(
-  id: string,
-  basedir: string,
-  preserveSymlinks = false
-): string {
-  const pkgs = id.split('>').map((pkg) => pkg.trim())
-  try {
-    for (const pkg of pkgs) {
-      basedir = resolveFrom(pkg, basedir, preserveSymlinks)
-    }
-  } catch {}
-  return basedir
-}
+export const bareImportRE: RegExp = /^(?![a-zA-Z]:)[\w@](?!.*:\/\/)/
+export const deepImportRE: RegExp = /^([^@][^/]*)\/|^(@[^/]+\/[^/]+)\//
+
+export const _dirname: string = path.dirname(
+  fileURLToPath(/** #__KEEP__ */ import.meta.url),
+)
+
+// https://github.com/rolldown/rolldown/blob/62fba31428af244f871f0e119ed43936ee5d01fd/packages/rolldown/src/log/logger.ts#L64
+export const rollupVersion = '4.23.0'
+export { VERSION as rolldownVersion } from 'rolldown'
 
 // set in bin/vite.js
 const filter = process.env.VITE_DEBUG_FILTER
@@ -115,30 +179,54 @@ const DEBUG = process.env.DEBUG
 
 interface DebuggerOptions {
   onlyWhenFocused?: boolean | string
+  depth?: number
 }
 
 export type ViteDebugScope = `vite:${string}`
 
 export function createDebugger(
   namespace: ViteDebugScope,
-  options: DebuggerOptions = {}
-): debug.Debugger['log'] {
+  options: DebuggerOptions = {},
+): Debugger['log'] | undefined {
   const log = debug(namespace)
-  const { onlyWhenFocused } = options
-  const focus =
-    typeof onlyWhenFocused === 'string' ? onlyWhenFocused : namespace
-  return (msg: string, ...args: any[]) => {
-    if (filter && !msg.includes(filter)) {
-      return
+  const { onlyWhenFocused, depth } = options
+
+  if (depth && log.inspectOpts && log.inspectOpts.depth == null) {
+    log.inspectOpts.depth = options.depth
+  }
+
+  let enabled = log.enabled
+  if (enabled && onlyWhenFocused) {
+    const ns = typeof onlyWhenFocused === 'string' ? onlyWhenFocused : namespace
+    enabled = !!DEBUG?.includes(ns)
+  }
+
+  if (enabled) {
+    return (...args: [string, ...any[]]) => {
+      if (!filter || args.some((a) => a?.includes?.(filter))) {
+        log(...args)
+      }
     }
-    if (onlyWhenFocused && !DEBUG?.includes(focus)) {
-      return
-    }
-    log(msg, ...args)
   }
 }
 
-export const isWindows = os.platform() === 'win32'
+function testCaseInsensitiveFS() {
+  if (!CLIENT_ENTRY.endsWith('client.mjs')) {
+    throw new Error(
+      `cannot test case insensitive FS, CLIENT_ENTRY const doesn't contain client.mjs`,
+    )
+  }
+  if (!fs.existsSync(CLIENT_ENTRY)) {
+    throw new Error(
+      'cannot test case insensitive FS, CLIENT_ENTRY does not point to an existing file: ' +
+        CLIENT_ENTRY,
+    )
+  }
+  return fs.existsSync(CLIENT_ENTRY.replace('client.mjs', 'cLiEnT.mjs'))
+}
+
+export const isCaseInsensitiveFS: boolean = testCaseInsensitiveFS()
+
 const VOLUME_RE = /^[A-Z]:/i
 
 export function normalizePath(id: string): string {
@@ -146,60 +234,87 @@ export function normalizePath(id: string): string {
 }
 
 export function fsPathFromId(id: string): string {
-  const fsPath = normalizePath(id.slice(FS_PREFIX.length))
-  return fsPath.startsWith('/') || fsPath.match(VOLUME_RE)
-    ? fsPath
-    : `/${fsPath}`
+  const fsPath = normalizePath(
+    id.startsWith(FS_PREFIX) ? id.slice(FS_PREFIX.length) : id,
+  )
+  return fsPath[0] === '/' || VOLUME_RE.test(fsPath) ? fsPath : `/${fsPath}`
 }
 
-export function ensureVolumeInPath(file: string): string {
-  return isWindows ? path.resolve(file) : file
+export function fsPathFromUrl(url: string): string {
+  return fsPathFromId(cleanUrl(url))
 }
 
-export const queryRE = /\?.*$/s
-export const hashRE = /#.*$/s
+/**
+ * Check if dir is a parent of file
+ *
+ * Warning: parameters are not validated, only works with normalized absolute paths
+ *
+ * @param dir - normalized absolute path
+ * @param file - normalized absolute path
+ * @returns true if dir is a parent of file
+ */
+export function isParentDirectory(dir: string, file: string): boolean {
+  dir = withTrailingSlash(dir)
+  return (
+    file.startsWith(dir) ||
+    (isCaseInsensitiveFS && file.toLowerCase().startsWith(dir.toLowerCase()))
+  )
+}
 
-export const cleanUrl = (url: string): string =>
-  url.replace(hashRE, '').replace(queryRE, '')
+/**
+ * Check if 2 file name are identical
+ *
+ * Warning: parameters are not validated, only works with normalized absolute paths
+ *
+ * @param file1 - normalized absolute path
+ * @param file2 - normalized absolute path
+ * @returns true if both files url are identical
+ */
+export function isSameFilePath(file1: string, file2: string): boolean {
+  return (
+    file1 === file2 ||
+    (isCaseInsensitiveFS && file1.toLowerCase() === file2.toLowerCase())
+  )
+}
 
-export const externalRE = /^(https?:)?\/\//
+export const externalRE: RegExp = /^([a-z]+:)?\/\//
 export const isExternalUrl = (url: string): boolean => externalRE.test(url)
 
-export const dataUrlRE = /^\s*data:/i
+export const dataUrlRE: RegExp = /^\s*data:/i
 export const isDataUrl = (url: string): boolean => dataUrlRE.test(url)
 
-export const virtualModuleRE = /^virtual-module:.*/
+export const virtualModuleRE: RegExp = /^virtual-module:.*/
 export const virtualModulePrefix = 'virtual-module:'
 
-const knownJsSrcRE = /\.((j|t)sx?|mjs|vue|marko|svelte|astro)($|\?)/
+// NOTE: We should start relying on the "Sec-Fetch-Dest" header instead of this
+// hardcoded list. We can eventually remove this function when the minimum version
+// of browsers we support in dev all support this header.
+const knownJsSrcRE =
+  /\.(?:[jt]sx?|m[jt]s|vue|marko|svelte|astro|imba|mdx)(?:$|\?)/
 export const isJSRequest = (url: string): boolean => {
   url = cleanUrl(url)
   if (knownJsSrcRE.test(url)) {
     return true
   }
-  if (!path.extname(url) && !url.endsWith('/')) {
+  if (!path.extname(url) && url[url.length - 1] !== '/') {
     return true
   }
   return false
 }
 
-const knownTsRE = /\.(ts|mts|cts|tsx)$/
-const knownTsOutputRE = /\.(js|mjs|cjs|jsx)$/
-export const isTsRequest = (url: string) => knownTsRE.test(cleanUrl(url))
-export const isPossibleTsOutput = (url: string) =>
-  knownTsOutputRE.test(cleanUrl(url))
-export const getTsSrcPath = (filename: string) =>
-  filename.replace(/\.([cm])?(js)(x?)(\?|$)/, '.$1ts$3')
+export const isCSSRequest = (request: string): boolean =>
+  CSS_LANGS_RE.test(request)
 
 const importQueryRE = /(\?|&)import=?(?:&|$)/
+const directRequestRE = /(\?|&)direct=?(?:&|$)/
 const internalPrefixes = [
   FS_PREFIX,
   VALID_ID_PREFIX,
   CLIENT_PUBLIC_PATH,
-  ENV_PUBLIC_PATH
+  ENV_PUBLIC_PATH,
 ]
 const InternalPrefixRE = new RegExp(`^(?:${internalPrefixes.join('|')})`)
-const trailingSeparatorRE = /[\?&]$/
+const trailingSeparatorRE = /[?&]$/
 export const isImportRequest = (url: string): boolean => importQueryRE.test(url)
 export const isInternalRequest = (url: string): boolean =>
   InternalPrefixRE.test(url)
@@ -207,23 +322,20 @@ export const isInternalRequest = (url: string): boolean =>
 export function removeImportQuery(url: string): string {
   return url.replace(importQueryRE, '$1').replace(trailingSeparatorRE, '')
 }
+export function removeDirectQuery(url: string): string {
+  return url.replace(directRequestRE, '$1').replace(trailingSeparatorRE, '')
+}
+
+export const urlRE: RegExp = /(\?|&)url(?:&|$)/
+export const rawRE: RegExp = /(\?|&)raw(?:&|$)/
+export function removeUrlQuery(url: string): string {
+  return url.replace(urlRE, '$1').replace(trailingSeparatorRE, '')
+}
 
 export function injectQuery(url: string, queryToInject: string): string {
-  // encode percents for consistent behavior with pathToFileURL
-  // see #2614 for details
-  // BROWSER VITE patch: fix logic for browser URL support
-  let resolvedUrl = new URL(url.replace(/%/g, '%25'), 'file:///')
-  // if (resolvedUrl.protocol !== 'relative:') {
-  //   resolvedUrl = pathToFileURL(url)
-  // }
-  let { pathname, search, hash } = resolvedUrl
-  // if (protocol === 'file:') {
-  //   pathname = pathname.slice(1)
-  // }
-  pathname = decodeURIComponent(pathname)
-  return `${pathname}?${queryToInject}${search ? `&` + search.slice(1) : ''}${
-    hash || ''
-  }`
+  const { file, postfix } = splitFileAndPostfix(url)
+  const normalizedFile = isWindows ? slash(file) : file
+  return `${normalizedFile}?${queryToInject}${postfix[0] === '?' ? `&${postfix.slice(1)}` : /* hash only */ postfix}`
 }
 
 const timestampRE = /\bt=\d{13}&?\b/
@@ -234,7 +346,7 @@ export function removeTimestampQuery(url: string): string {
 export async function asyncReplace(
   input: string,
   re: RegExp,
-  replacer: (match: RegExpExecArray) => string | Promise<string>
+  replacer: (match: RegExpExecArray) => string | Promise<string>,
 ): Promise<string> {
   let match: RegExpExecArray | null
   let remaining = input
@@ -252,11 +364,11 @@ export function timeFrom(start: number, subtract = 0): string {
   const time: number | string = performance.now() - start - subtract
   const timeString = (time.toFixed(2) + `ms`).padEnd(5, ' ')
   if (time < 10) {
-    return chalk.green(timeString)
+    return colors.green(timeString)
   } else if (time < 50) {
-    return chalk.yellow(timeString)
+    return colors.yellow(timeString)
   } else {
-    return chalk.red(timeString)
+    return colors.red(timeString)
   }
 }
 
@@ -267,20 +379,13 @@ export function prettifyUrl(url: string, root: string): string {
   url = removeTimestampQuery(url)
   const isAbsoluteFile = url.startsWith(root)
   if (isAbsoluteFile || url.startsWith(FS_PREFIX)) {
-    let file = path.relative(root, isAbsoluteFile ? url : fsPathFromId(url))
-    const seg = file.split('/')
-    const npmIndex = seg.indexOf(`node_modules`)
-    const isSourceMap = file.endsWith('.map')
-    if (npmIndex > 0) {
-      file = seg[npmIndex + 1]
-      if (file.startsWith('@')) {
-        file = `${file}/${seg[npmIndex + 2]}`
-      }
-      file = `npm: ${chalk.dim(file)}${isSourceMap ? ` (source map)` : ``}`
-    }
-    return chalk.dim(file)
+    const file = path.posix.relative(
+      root,
+      isAbsoluteFile ? url : fsPathFromId(url),
+    )
+    return colors.dim(file)
   } else {
-    return chalk.dim(url)
+    return colors.dim(url)
   }
 }
 
@@ -292,24 +397,71 @@ export function isDefined<T>(value: T | undefined | null): value is T {
   return value != null
 }
 
-export function lookupFile(
-  dir: string,
-  formats: string[],
-  pathOnly = false
-): string | undefined {
-  for (const format of formats) {
-    const fullPath = path.join(dir, format)
-    if (fs.existsSync(fullPath) && fs.statSync(fullPath).isFile()) {
-      return pathOnly ? fullPath : fs.readFileSync(fullPath, 'utf-8')
-    }
-  }
-  const parentDir = path.dirname(dir)
-  if (parentDir !== dir) {
-    return lookupFile(parentDir, formats, pathOnly)
+export function tryStatSync(file: string): fs.Stats | undefined {
+  try {
+    // The "throwIfNoEntry" is a performance optimization for cases where the file does not exist
+    return fs.statSync(file, { throwIfNoEntry: false })
+  } catch {
+    // Ignore errors
   }
 }
 
-const splitRE = /\r?\n/
+export function lookupFile(
+  dir: string,
+  fileNames: string[],
+): string | undefined {
+  while (dir) {
+    for (const fileName of fileNames) {
+      const fullPath = path.join(dir, fileName)
+      if (tryStatSync(fullPath)?.isFile()) return fullPath
+    }
+    const parentDir = path.dirname(dir)
+    if (parentDir === dir) return
+
+    dir = parentDir
+  }
+}
+
+export function isFilePathESM(
+  filePath: string,
+  packageCache?: PackageCache,
+): boolean {
+  if (/\.m[jt]s$/.test(filePath)) {
+    return true
+  } else if (/\.c[jt]s$/.test(filePath)) {
+    return false
+  } else {
+    // check package.json for type: "module"
+    try {
+      const pkg = findNearestPackageData(path.dirname(filePath), packageCache)
+      return pkg?.data.type === 'module'
+    } catch {
+      return false
+    }
+  }
+}
+
+/**
+ * Whether the file's module format is explicitly determined as ESM or CJS by
+ * its extension or the nearest `package.json` `"type"` field, as opposed to
+ * being ambiguous.
+ */
+export function isFilePathFormatExplicit(
+  filePath: string,
+  packageCache?: PackageCache,
+): boolean {
+  if (/\.[mc][jt]s$/.test(filePath)) {
+    return true
+  }
+  try {
+    const pkg = findNearestPackageData(path.dirname(filePath), packageCache)
+    return pkg?.data.type === 'module' || pkg?.data.type === 'commonjs'
+  } catch {
+    return false
+  }
+}
+
+export const splitRE: RegExp = /\r?\n/g
 
 const range: number = 2
 
@@ -318,135 +470,181 @@ export function pad(source: string, n = 2): string {
   return lines.map((l) => ` `.repeat(n) + l).join(`\n`)
 }
 
-export function posToNumber(
-  source: string,
-  pos: number | { line: number; column: number }
-): number {
+type Pos = {
+  /** 1-based */
+  line: number
+  /** 0-based */
+  column: number
+}
+
+export function posToNumber(source: string, pos: number | Pos): number {
   if (typeof pos === 'number') return pos
   const lines = source.split(splitRE)
   const { line, column } = pos
   let start = 0
-  for (let i = 0; i < line - 1; i++) {
+  for (let i = 0; i < line - 1 && i < lines.length; i++) {
     start += lines[i].length + 1
   }
   return start + column
 }
 
-export function numberToPos(
-  source: string,
-  offset: number | { line: number; column: number }
-): { line: number; column: number } {
+export function numberToPos(source: string, offset: number | Pos): Pos {
   if (typeof offset !== 'number') return offset
   if (offset > source.length) {
     throw new Error(
-      `offset is longer than source length! offset ${offset} > length ${source.length}`
+      `offset is longer than source length! offset ${offset} > length ${source.length}`,
     )
   }
-  const lines = source.split(splitRE)
-  let counted = 0
-  let line = 0
-  let column = 0
-  for (; line < lines.length; line++) {
-    const lineLength = lines[line].length + 1
-    if (counted + lineLength >= offset) {
-      column = offset - counted + 1
-      break
-    }
-    counted += lineLength
+
+  const lines = source.slice(0, offset).split(splitRE)
+  return {
+    line: lines.length,
+    column: lines[lines.length - 1].length,
   }
-  return { line: line + 1, column }
 }
+
+const MAX_DISPLAY_LEN = 120
+const ELLIPSIS = '...'
 
 export function generateCodeFrame(
   source: string,
-  start: number | { line: number; column: number } = 0,
-  end?: number
+  start: number | Pos = 0,
+  end?: number | Pos,
 ): string {
-  start = posToNumber(source, start)
-  end = end || start
+  start = Math.max(posToNumber(source, start), 0)
+  end = Math.min(
+    end !== undefined ? posToNumber(source, end) : start,
+    source.length,
+  )
+  const lastPosLine =
+    end !== undefined
+      ? numberToPos(source, end).line
+      : numberToPos(source, start).line + range
+  const lineNumberWidth = Math.max(3, String(lastPosLine).length + 1)
   const lines = source.split(splitRE)
   let count = 0
   const res: string[] = []
   for (let i = 0; i < lines.length; i++) {
-    count += lines[i].length + 1
+    count += lines[i].length
     if (count >= start) {
       for (let j = i - range; j <= i + range || end > count; j++) {
         if (j < 0 || j >= lines.length) continue
         const line = j + 1
-        res.push(
-          `${line}${' '.repeat(Math.max(3 - String(line).length, 0))}|  ${
-            lines[j]
-          }`
-        )
         const lineLength = lines[j].length
+        const pad = Math.max(start - (count - lineLength), 0)
+        const underlineLength = Math.max(
+          1,
+          end > count ? lineLength - pad : end - start,
+        )
+
+        let displayLine = lines[j]
+        let underlinePad = pad
+        if (lineLength > MAX_DISPLAY_LEN) {
+          let startIdx = 0
+          if (j === i) {
+            if (underlineLength > MAX_DISPLAY_LEN) {
+              startIdx = pad
+            } else {
+              const center = pad + Math.floor(underlineLength / 2)
+              startIdx = Math.max(0, center - Math.floor(MAX_DISPLAY_LEN / 2))
+            }
+            underlinePad =
+              Math.max(0, pad - startIdx) + (startIdx > 0 ? ELLIPSIS.length : 0)
+          }
+          const prefix = startIdx > 0 ? ELLIPSIS : ''
+          const suffix = lineLength - startIdx > MAX_DISPLAY_LEN ? ELLIPSIS : ''
+          const sliceLen = MAX_DISPLAY_LEN - prefix.length - suffix.length
+          displayLine =
+            prefix + displayLine.slice(startIdx, startIdx + sliceLen) + suffix
+        }
+        res.push(
+          `${line}${' '.repeat(lineNumberWidth - String(line).length)}|  ${displayLine}`,
+        )
         if (j === i) {
           // push underline
-          const pad = start - (count - lineLength) + 1
-          const length = Math.max(
-            1,
-            end > count ? lineLength - pad : end - start
+          const underline = '^'.repeat(
+            Math.min(underlineLength, MAX_DISPLAY_LEN),
           )
-          res.push(`   |  ` + ' '.repeat(pad) + '^'.repeat(length))
+          res.push(
+            `${' '.repeat(lineNumberWidth)}|  ` +
+              ' '.repeat(underlinePad) +
+              underline,
+          )
         } else if (j > i) {
           if (end > count) {
             const length = Math.max(Math.min(end - count, lineLength), 1)
-            res.push(`   |  ` + '^'.repeat(length))
+            const underline = '^'.repeat(Math.min(length, MAX_DISPLAY_LEN))
+            res.push(`${' '.repeat(lineNumberWidth)}|  ` + underline)
           }
           count += lineLength + 1
         }
       }
       break
     }
+    count++
   }
   return res.join('\n')
 }
 
-export function writeFile(
-  filename: string,
-  content: string | Uint8Array
-): void {
-  const dir = path.dirname(filename)
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true })
-  }
-  fs.writeFileSync(filename, content)
-}
-
-/**
- * Use instead of fs.existsSync(filename)
- * #2051 if we don't have read permission on a directory, existsSync() still
- * works and will result in massively slow subsequent checks (which are
- * unnecessary in the first place)
- */
 export function isFileReadable(filename: string): boolean {
+  if (!tryStatSync(filename)) {
+    return false
+  }
+
   try {
+    // Check if current process has read permission to the file
     fs.accessSync(filename, fs.constants.R_OK)
+
     return true
   } catch {
     return false
   }
 }
 
+const splitFirstDirRE = /(.+?)[\\/](.+)/
+
 /**
  * Delete every file and subdirectory. **The given directory must exist.**
- * Pass an optional `skip` array to preserve files in the root directory.
+ * Pass an optional `skip` array to preserve files under the root directory.
  */
 export function emptyDir(dir: string, skip?: string[]): void {
+  const skipInDir: string[] = []
+  let nested: Map<string, string[]> | null = null
+  if (skip?.length) {
+    for (const file of skip) {
+      if (path.dirname(file) !== '.') {
+        const matched = splitFirstDirRE.exec(file)
+        if (matched) {
+          nested ??= new Map()
+          const [, nestedDir, skipPath] = matched
+          let nestedSkip = nested.get(nestedDir)
+          if (!nestedSkip) {
+            nestedSkip = []
+            nested.set(nestedDir, nestedSkip)
+          }
+          if (!nestedSkip.includes(skipPath)) {
+            nestedSkip.push(skipPath)
+          }
+        }
+      } else {
+        skipInDir.push(file)
+      }
+    }
+  }
   for (const file of fs.readdirSync(dir)) {
-    if (skip?.includes(file)) {
+    if (skipInDir.includes(file)) {
       continue
     }
-    const abs = path.resolve(dir, file)
-    // baseline is Node 12 so can't use rmSync :(
-    if (fs.lstatSync(abs).isDirectory()) {
-      emptyDir(abs)
-      fs.rmdirSync(abs)
+    if (nested?.has(file)) {
+      emptyDir(path.resolve(dir, file), nested.get(file))
     } else {
-      fs.unlinkSync(abs)
+      fs.rmSync(path.resolve(dir, file), { recursive: true, force: true })
     }
   }
 }
 
+// NOTE: we cannot use `fs.cpSync` because of a bug in Node.js (https://github.com/nodejs/node/issues/58768, https://github.com/nodejs/node/issues/59168)
+//       also note that we should set `dereference: true` when we use `fs.cpSync`
 export function copyDir(srcDir: string, destDir: string): void {
   fs.mkdirSync(destDir, { recursive: true })
   for (const file of fs.readdirSync(srcDir)) {
@@ -464,19 +662,108 @@ export function copyDir(srcDir: string, destDir: string): void {
   }
 }
 
-export function ensureLeadingSlash(path: string): string {
-  return !path.startsWith('/') ? '/' + path : path
+export const ERR_SYMLINK_IN_RECURSIVE_READDIR =
+  'ERR_SYMLINK_IN_RECURSIVE_READDIR'
+export async function recursiveReaddir(dir: string): Promise<string[]> {
+  if (!fs.existsSync(dir)) {
+    return []
+  }
+  let dirents: fs.Dirent[]
+  try {
+    dirents = await fsp.readdir(dir, { withFileTypes: true })
+  } catch (e) {
+    if (e.code === 'EACCES') {
+      // Ignore permission errors
+      return []
+    }
+    throw e
+  }
+  if (dirents.some((dirent) => dirent.isSymbolicLink())) {
+    const err: any = new Error(
+      'Symbolic links are not supported in recursiveReaddir',
+    )
+    err.code = ERR_SYMLINK_IN_RECURSIVE_READDIR
+    throw err
+  }
+  const files = await Promise.all(
+    dirents.map((dirent) => {
+      const res = path.resolve(dir, dirent.name)
+      return dirent.isDirectory() ? recursiveReaddir(res) : normalizePath(res)
+    }),
+  )
+  return files.flat(1)
+}
+
+// `fs.realpathSync.native` resolves differently in Windows network drive,
+// causing file read errors. skip for now.
+// https://github.com/nodejs/node/issues/37737
+export let safeRealpathSync:
+  | typeof windowsSafeRealPathSync
+  | typeof fs.realpathSync.native = isWindows
+  ? windowsSafeRealPathSync
+  : fs.realpathSync.native
+
+// Based on https://github.com/larrybahr/windows-network-drive
+// MIT License, Copyright (c) 2017 Larry Bahr
+const windowsNetworkMap = new Map()
+function windowsMappedRealpathSync(path: string) {
+  const realPath = fs.realpathSync.native(path)
+  if (realPath.startsWith('\\\\')) {
+    for (const [network, volume] of windowsNetworkMap) {
+      if (realPath.startsWith(network)) return realPath.replace(network, volume)
+    }
+  }
+  return realPath
+}
+const parseNetUseRE = /^\w* +(\w:) +([^ ]+)\s/
+let firstSafeRealPathSyncRun = false
+
+function windowsSafeRealPathSync(path: string): string {
+  if (!firstSafeRealPathSyncRun) {
+    optimizeSafeRealPathSync()
+    firstSafeRealPathSyncRun = true
+  }
+  return fs.realpathSync(path)
+}
+
+function optimizeSafeRealPathSync() {
+  // Check the availability `fs.realpathSync.native`
+  // in Windows virtual and RAM disks that bypass the Volume Mount Manager, in programs such as imDisk
+  // get the error EISDIR: illegal operation on a directory
+  try {
+    fs.realpathSync.native(path.resolve('./'))
+  } catch (error) {
+    if (error.message.includes('EISDIR: illegal operation on a directory')) {
+      safeRealpathSync = fs.realpathSync
+      return
+    }
+  }
+  exec('net use', { windowsHide: true }, (error, stdout) => {
+    if (error) return
+    const lines = stdout.split('\n')
+    // OK           Y:        \\NETWORKA\Foo         Microsoft Windows Network
+    // OK           Z:        \\NETWORKA\Bar         Microsoft Windows Network
+    for (const line of lines) {
+      const m = parseNetUseRE.exec(line)
+      if (m) windowsNetworkMap.set(m[2], m[1])
+    }
+    if (windowsNetworkMap.size === 0) {
+      safeRealpathSync = fs.realpathSync.native
+    } else {
+      safeRealpathSync = windowsMappedRealpathSync
+    }
+  })
 }
 
 export function ensureWatchedFile(
   watcher: FSWatcher,
   file: string | null,
-  root: string
+  root: string,
 ): void {
   if (
     file &&
     // only need to watch if out of root
-    !file.startsWith(root + '/') &&
+    !file.startsWith(withTrailingSlash(root)) &&
     // some rollup plugins use null bytes for private resolved Ids
     !file.includes('\0') &&
     fs.existsSync(file)
@@ -490,36 +777,90 @@ interface ImageCandidate {
   url: string
   descriptor: string
 }
-const escapedSpaceCharacters = /( |\\t|\\n|\\f|\\r)+/g
-export async function processSrcSet(
+
+function joinSrcset(ret: ImageCandidate[]) {
+  return ret
+    .map(({ url, descriptor }) => url + (descriptor ? ` ${descriptor}` : ''))
+    .join(', ')
+}
+
+/**
+ This regex represents a loose rule of an “image candidate string” and "image set options".
+
+ @see https://html.spec.whatwg.org/multipage/images.html#srcset-attribute
+ @see https://drafts.csswg.org/css-images-4/#image-set-notation
+
+  The Regex has named capturing groups `url` and `descriptor`.
+  The `url` group can be:
+  * any CSS function
+  * CSS string (single or double-quoted)
+  * URL string (unquoted)
+  The `descriptor` is anything after the space and before the comma.
+ */
+const imageCandidateRegex =
+  /(?:^|\s|(?<=,))(?<url>[\w-]+\([^)]*\)|"[^"]*"|'[^']*'|[^,]\S*[^,])\s*(?:\s(?<descriptor>\w[^,]+))?(?:,|$)/g
+const escapedSpaceCharacters = /(?: |\\t|\\n|\\f|\\r)+/g
+
+export function parseSrcset(string: string): ImageCandidate[] {
+  const matches = string
+    .trim()
+    .replace(escapedSpaceCharacters, ' ')
+    .replace(/\r?\n/, '')
+    .replace(/,\s+/, ', ')
+    .replaceAll(/\s+/g, ' ')
+    .matchAll(imageCandidateRegex)
+  return Array.from(matches, ({ groups }) => ({
+    url: groups?.url?.trim() ?? '',
+    descriptor: groups?.descriptor?.trim() ?? '',
+  })).filter(({ url }) => !!url)
+}
+
+export function processSrcSet(
   srcs: string,
-  replacer: (arg: ImageCandidate) => Promise<string>
+  replacer: (arg: ImageCandidate) => Promise<string>,
 ): Promise<string> {
-  const imageCandidates: ImageCandidate[] = srcs
-    .split(',')
-    .map((s) => {
-      const [url, descriptor] = s
-        .replace(escapedSpaceCharacters, ' ')
-        .trim()
-        .split(' ', 2)
-      return { url, descriptor }
-    })
-    .filter(({ url }) => !!url)
+  return Promise.all(
+    parseSrcset(srcs).map(async ({ url, descriptor }) => ({
+      url: await replacer({ url, descriptor }),
+      descriptor,
+    })),
+  ).then(joinSrcset)
+}
 
-  const ret = await Promise.all(
-    imageCandidates.map(async ({ url, descriptor }) => {
-      return {
-        url: await replacer({ url, descriptor }),
-        descriptor
-      }
-    })
+export function processSrcSetSync(
+  srcs: string,
+  replacer: (arg: ImageCandidate) => string,
+): string {
+  return joinSrcset(
+    parseSrcset(srcs).map(({ url, descriptor }) => ({
+      url: replacer({ url, descriptor }),
+      descriptor,
+    })),
   )
+}
 
-  return ret.reduce((prev, { url, descriptor }, index) => {
-    descriptor = descriptor || ''
-    return (prev +=
-      url + ` ${descriptor}${index === ret.length - 1 ? '' : ', '}`)
-  }, '')
+const windowsDriveRE = /^[A-Z]:/
+const replaceWindowsDriveRE = /^([A-Z]):\//
+const linuxAbsolutePathRE = /^\/[^/]/
+function escapeToLinuxLikePath(path: string) {
+  if (windowsDriveRE.test(path)) {
+    return path.replace(replaceWindowsDriveRE, '/windows/$1/')
+  }
+  if (linuxAbsolutePathRE.test(path)) {
+    return `/linux${path}`
+  }
+  return path
+}
+
+const revertWindowsDriveRE = /^\/windows\/([A-Z])\//
+function unescapeToLinuxLikePath(path: string) {
+  if (path.startsWith('/linux/')) {
+    return path.slice('/linux'.length)
+  }
+  if (path.startsWith('/windows/')) {
+    return path.replace(revertWindowsDriveRE, '$1:/')
+  }
+  return path
 }
 
 // based on https://github.com/sveltejs/svelte/blob/abf11bb02b2afbd3e4cac509a0f70e318c306364/src/compiler/utils/mapped_code.ts#L221
@@ -527,11 +868,15 @@ const nullSourceMap: RawSourceMap = {
   names: [],
   sources: [],
   mappings: '',
-  version: 3
+  version: 3,
 }
+/**
+ * Combines multiple sourcemaps into a single sourcemap.
+ * Note that the length of sourcemapList must be 2.
+ */
 export function combineSourcemaps(
   filename: string,
-  sourcemapList: Array<DecodedSourceMap | RawSourceMap>
+  sourcemapList: Array<DecodedSourceMap | RawSourceMap>,
 ): RawSourceMap {
   if (
     sourcemapList.length === 0 ||
@@ -540,29 +885,47 @@ export function combineSourcemaps(
     return { ...nullSourceMap }
   }
 
+  // hack for parse broken with normalized absolute paths on windows (C:/path/to/something).
+  // escape them to linux like paths
+  // also avoid mutation here to prevent breaking plugin's using cache to generate sourcemaps like vue (see #7442)
+  sourcemapList = sourcemapList.map((sourcemap) => {
+    const newSourcemaps = { ...sourcemap }
+    newSourcemaps.sources = sourcemap.sources.map((source) =>
+      source ? escapeToLinuxLikePath(source) : null,
+    )
+    if (sourcemap.sourceRoot) {
+      newSourcemaps.sourceRoot = escapeToLinuxLikePath(sourcemap.sourceRoot)
+    }
+    return newSourcemaps
+  })
+  const escapedFilename = escapeToLinuxLikePath(filename)
+
   // We don't declare type here so we can convert/fake/map as RawSourceMap
   let map //: SourceMap
   let mapIndex = 1
   const useArrayInterface =
     sourcemapList.slice(0, -1).find((m) => m.sources.length !== 1) === undefined
   if (useArrayInterface) {
-    map = remapping(sourcemapList, () => null, true)
+    map = remapping(sourcemapList, () => null)
   } else {
-    map = remapping(
-      sourcemapList[0],
-      function loader(sourcefile) {
-        if (sourcefile === filename && sourcemapList[mapIndex]) {
-          return sourcemapList[mapIndex++]
-        } else {
-          return { ...nullSourceMap }
-        }
-      },
-      true
-    )
+    map = remapping(sourcemapList[0], function loader(sourcefile) {
+      // this line assumes that the length of the sourcemapList is 2
+      if (sourcefile === escapedFilename && sourcemapList[mapIndex]) {
+        return sourcemapList[mapIndex++]
+      } else {
+        return null
+      }
+    })
   }
   if (!map.file) {
     delete map.file
   }
+
+  // unescape the previous hack
+  map.sources = map.sources.map((source) =>
+    source ? unescapeToLinuxLikePath(source) : source,
+  )
+  map.file = filename
 
   return map as RawSourceMap
 }
@@ -571,24 +934,60 @@ export function unique<T>(arr: T[]): T[] {
   return Array.from(new Set(arr))
 }
 
+/**
+ * Returns resolved localhost address when `dns.lookup` result differs from DNS
+ *
+ * `dns.lookup` result is same when defaultResultOrder is `verbatim`.
+ * Even if defaultResultOrder is `ipv4first`, `dns.lookup` result maybe same.
+ * For example, when IPv6 is not supported on that machine/network.
+ */
+export function getLocalhostAddressIfDiffersFromDNS():
+  | Promise<string | undefined>
+  | undefined {
+  // dns.getDefaultResultOrder is not available in bun 1.3.11 and deno 2.7.11
+  // while this is a bug in bun and deno, since this function is commonly called,
+  // we give a workaround specially until the API is supported in a few versions
+  if (dns.getDefaultResultOrder && dns.getDefaultResultOrder() === 'verbatim') {
+    return undefined
+  }
+  return Promise.all([
+    dns.lookup('localhost'),
+    dns.lookup('localhost', { verbatim: true }),
+  ]).then(([nodeResult, dnsResult]) => {
+    const isSame =
+      nodeResult.family === dnsResult.family &&
+      nodeResult.address === dnsResult.address
+    return isSame ? undefined : nodeResult.address
+  })
+}
+
+export function diffDnsOrderChange(
+  oldUrls: ViteDevServer['resolvedUrls'],
+  newUrls: ViteDevServer['resolvedUrls'],
+): boolean {
+  return !(
+    oldUrls === newUrls ||
+    (oldUrls &&
+      newUrls &&
+      arrayEqual(oldUrls.local, newUrls.local) &&
+      arrayEqual(oldUrls.network, newUrls.network))
+  )
+}
+
 export interface Hostname {
-  // undefined sets the default behaviour of server.listen
+  /** undefined sets the default behaviour of server.listen */
   host: string | undefined
-  // resolve to localhost when possible
+  /** resolve to localhost when possible */
   name: string
 }
 
-export function resolveHostname(
-  optionsHost: string | boolean | undefined
-): Hostname {
+export async function resolveHostname(
+  optionsHost: string | boolean | undefined,
+): Promise<Hostname> {
   let host: string | undefined
-  if (
-    optionsHost === undefined ||
-    optionsHost === false ||
-    optionsHost === 'localhost'
-  ) {
+  if (optionsHost === undefined || optionsHost === false) {
     // Use a secure default
-    host = '127.0.0.1'
+    host = 'localhost'
   } else if (optionsHost === true) {
     // If passed --host in the CLI without arguments
     host = undefined // undefined typically means 0.0.0.0 or :: (listen on all IPs)
@@ -596,39 +995,941 @@ export function resolveHostname(
     host = optionsHost
   }
 
-  // Set host name to localhost when possible, unless the user explicitly asked for '127.0.0.1'
-  const name =
-    (optionsHost !== '127.0.0.1' && host === '127.0.0.1') ||
-    host === '0.0.0.0' ||
-    host === '::' ||
-    host === undefined
-      ? 'localhost'
-      : host
+  // Set host name to localhost when possible
+  let name = host === undefined || wildcardHosts.has(host) ? 'localhost' : host
+
+  if (host === 'localhost') {
+    // See #8647 for more details.
+    const localhostAddr = await getLocalhostAddressIfDiffersFromDNS()
+    if (localhostAddr) {
+      name = localhostAddr
+    }
+  }
 
   return { host, name }
+}
+
+export function extractHostnamesFromCerts(
+  certs: HttpsServerOptions['cert'] | undefined,
+): string[] {
+  const certList = certs ? arraify(certs) : []
+  if (certList.length === 0) return []
+
+  const hostnames = certList
+    .map((cert) => {
+      try {
+        return new crypto.X509Certificate(cert)
+      } catch {
+        return null
+      }
+    })
+    .flatMap((cert) =>
+      cert?.subjectAltName
+        ? extractHostnamesFromSubjectAltName(cert.subjectAltName)
+        : [],
+    )
+
+  return unique(hostnames)
+}
+
+export function resolveServerUrls(
+  server: Server,
+  options: CommonServerOptions,
+  hostname: Hostname,
+  httpsOptions: HttpsServerOptions | undefined,
+  config: ResolvedConfig,
+): ResolvedServerUrls {
+  const address = server.address()
+
+  const isAddressInfo = (x: any): x is AddressInfo => x?.address
+  if (!isAddressInfo(address)) {
+    return { local: [], network: [] }
+  }
+
+  const local: string[] = []
+  const network: string[] = []
+  const protocol = options.https ? 'https' : 'http'
+  const port = address.port
+  const base =
+    config.rawBase === './' || config.rawBase === '' ? '/' : config.rawBase
+
+  if (hostname.host !== undefined && !wildcardHosts.has(hostname.host)) {
+    let hostnameName = hostname.name
+    // ipv6 host
+    if (hostnameName.includes(':')) {
+      hostnameName = `[${hostnameName}]`
+    }
+    const address = `${protocol}://${hostnameName}:${port}${base}`
+    if (loopbackHosts.has(hostname.host)) {
+      local.push(address)
+    } else {
+      network.push(address)
+    }
+  } else {
+    Object.values(os.networkInterfaces())
+      .flatMap((nInterface) => nInterface ?? [])
+      .filter((detail) => detail.address && detail.family === 'IPv4')
+      .forEach((detail) => {
+        let host = detail.address.replace('127.0.0.1', hostname.name)
+        // ipv6 host
+        if (host.includes(':')) {
+          host = `[${host}]`
+        }
+        const url = `${protocol}://${host}:${port}${base}`
+        if (detail.address.includes('127.0.0.1')) {
+          local.push(url)
+        } else {
+          network.push(url)
+        }
+      })
+  }
+
+  const hostnamesFromCert = extractHostnamesFromCerts(httpsOptions?.cert)
+  if (hostnamesFromCert.length > 0) {
+    const existings = new Set([...local, ...network])
+    local.push(
+      ...hostnamesFromCert
+        .map((hostname) => `${protocol}://${hostname}:${port}${base}`)
+        .filter((url) => !existings.has(url)),
+    )
+  }
+
+  return { local, network }
+}
+
+export function extractHostnamesFromSubjectAltName(
+  subjectAltName: string,
+): string[] {
+  const hostnames: string[] = []
+  let remaining = subjectAltName
+  while (remaining) {
+    const nameEndIndex = remaining.indexOf(':')
+    const name = remaining.slice(0, nameEndIndex)
+    remaining = remaining.slice(nameEndIndex + 1)
+    if (!remaining) break
+
+    const isQuoted = remaining[0] === '"'
+    let value: string
+    if (isQuoted) {
+      const endQuoteIndex = remaining.indexOf('"', 1)
+      value = JSON.parse(remaining.slice(0, endQuoteIndex + 1))
+      remaining = remaining.slice(endQuoteIndex + 1)
+    } else {
+      const maybeEndIndex = remaining.indexOf(',')
+      const endIndex = maybeEndIndex === -1 ? remaining.length : maybeEndIndex
+      value = remaining.slice(0, endIndex)
+      remaining = remaining.slice(endIndex)
+    }
+    remaining = remaining.slice(/* for , */ 1).trimStart()
+
+    if (
+      name === 'DNS' &&
+      // [::1] might be included but skip it as it's already included as a local address
+      value !== '[::1]' &&
+      // skip *.IPv4 addresses, which is invalid
+      !(value.startsWith('*.') && net.isIPv4(value.slice(2)))
+    ) {
+      hostnames.push(value.replace('*', 'vite'))
+    }
+  }
+  return hostnames
 }
 
 export function arraify<T>(target: T | T[]): T[] {
   return Array.isArray(target) ? target : [target]
 }
 
-export function toUpperCaseDriveLetter(pathName: string): string {
-  return pathName.replace(/^\w:/, (letter) => letter.toUpperCase())
+// Taken from https://stackoverflow.com/a/36328890
+export const multilineCommentsRE: RegExp = /\/\*[^*]*\*+(?:[^/*][^*]*\*+)*\//g
+export const singlelineCommentsRE: RegExp = /\/\/.*/g
+export const requestQuerySplitRE: RegExp = /\?(?!.*[/|}])/
+export const requestQueryMaybeEscapedSplitRE: RegExp = /\\?\?(?!.*[/|}])/
+
+export const blankReplacer = (match: string): string => ' '.repeat(match.length)
+
+export function getHash(text: Buffer | string, length = 8): string {
+  const h = crypto.hash('sha256', text, 'hex').substring(0, length)
+  if (length <= 64) return h
+  return h.padEnd(length, '_')
 }
 
-export const multilineCommentsRE = /\/\*(.|[\r\n])*?\*\//gm
-export const singlelineCommentsRE = /\/\/.*/g
+export function emptyCssComments(raw: string): string {
+  return raw.replace(multilineCommentsRE, blankReplacer)
+}
 
-export const usingDynamicImport = typeof jest === 'undefined'
+function backwardCompatibleWorkerPlugins(plugins: any) {
+  if (Array.isArray(plugins)) {
+    return plugins
+  }
+  if (typeof plugins === 'function') {
+    return plugins()
+  }
+  return []
+}
+
+type DeepWritable<T> =
+  T extends ReadonlyArray<unknown>
+    ? { -readonly [P in keyof T]: DeepWritable<T[P]> }
+    : T extends RegExp
+      ? RegExp
+      : T[keyof T] extends Function
+        ? T
+        : { -readonly [P in keyof T]: DeepWritable<T[P]> }
+
+export function deepClone<T>(value: T): DeepWritable<T> {
+  if (Array.isArray(value)) {
+    return value.map((v) => deepClone(v)) as DeepWritable<T>
+  }
+  if (isObject(value)) {
+    const cloned: Record<string, any> = {}
+    for (const key in value) {
+      cloned[key] = deepClone(value[key])
+    }
+    return cloned as DeepWritable<T>
+  }
+  if (typeof value === 'function') {
+    return value as DeepWritable<T>
+  }
+  if (value instanceof RegExp) {
+    return new RegExp(value) as DeepWritable<T>
+  }
+  if (typeof value === 'object' && value != null) {
+    throw new Error('Cannot deep clone non-plain object')
+  }
+  return value as DeepWritable<T>
+}
+
+type MaybeFallback<D, V> = undefined extends V ? Exclude<V, undefined> | D : V
+
+type MergeWithDefaultsResult<D, V> =
+  Equal<D, undefined> extends true
+    ? V
+    : D extends Function | Array<any>
+      ? MaybeFallback<D, V>
+      : V extends Function | Array<any>
+        ? MaybeFallback<D, V>
+        : D extends Record<string, any>
+          ? V extends Record<string, any>
+            ? {
+                [K in keyof D | keyof V]: K extends keyof D
+                  ? K extends keyof V
+                    ? MergeWithDefaultsResult<D[K], V[K]>
+                    : D[K]
+                  : K extends keyof V
+                    ? V[K]
+                    : never
+              }
+            : MaybeFallback<D, V>
+          : MaybeFallback<D, V>
+
+function mergeWithDefaultsRecursively<
+  D extends Record<string, any>,
+  V extends Record<string, any>,
+>(defaults: D, values: V): MergeWithDefaultsResult<D, V> {
+  const merged: Record<string, any> = defaults
+  for (const key in values) {
+    const value = values[key]
+    // let null to set the value (e.g. `server.watch: null`)
+    if (value === undefined) continue
+
+    const existing = merged[key]
+    if (existing === undefined) {
+      merged[key] = value
+      continue
+    }
+
+    if (isObject(existing) && isObject(value)) {
+      merged[key] = mergeWithDefaultsRecursively(existing, value)
+      continue
+    }
+
+    // use replace even for arrays
+    merged[key] = value
+  }
+  return merged as MergeWithDefaultsResult<D, V>
+}
+
+const environmentPathRE = /^environments\.[^.]+$/
+
+export function mergeWithDefaults<
+  D extends Record<string, any>,
+  V extends Record<string, any>,
+>(defaults: D, values: V): MergeWithDefaultsResult<DeepWritable<D>, V> {
+  // NOTE: we need to clone the value here to avoid mutating the defaults
+  const clonedDefaults = deepClone(defaults)
+  return mergeWithDefaultsRecursively(clonedDefaults, values)
+}
+
+const runtimeDeprecatedPath = new Set(['optimizeDeps', 'ssr.optimizeDeps'])
+const rollupOptionsDeprecationCall = (() => {
+  return () => {
+    const method = process.env.VITE_DEPRECATION_TRACE ? 'trace' : 'warn'
+    // eslint-disable-next-line no-console
+    console[method](
+      '`optimizeDeps.rollupOptions` / `ssr.optimizeDeps.rollupOptions` is deprecated. ' +
+        'Use `optimizeDeps.rolldownOptions` instead. Note that this option may be set by a plugin. ' +
+        (method === 'trace'
+          ? 'Showing trace because VITE_DEPRECATION_TRACE is set.'
+          : 'Set VITE_DEPRECATION_TRACE=1 to see where it is called.'),
+    )
+  }
+})()
+
+export function setupRollupOptionCompat<
+  T extends Pick<BuildEnvironmentOptions, 'rollupOptions' | 'rolldownOptions'>,
+>(
+  buildConfig: T,
+  path: string,
+): asserts buildConfig is T & {
+  rolldownOptions: Exclude<T['rolldownOptions'], undefined>
+} {
+  // if both rollupOptions and rolldownOptions are present,
+  // ignore rollupOptions and use rolldownOptions
+  buildConfig.rolldownOptions ??= buildConfig.rollupOptions
+  if (
+    runtimeDeprecatedPath.has(path) &&
+    buildConfig.rollupOptions &&
+    buildConfig.rolldownOptions !== buildConfig.rollupOptions
+  ) {
+    rollupOptionsDeprecationCall()
+  }
+
+  // proxy rolldownOptions to rollupOptions
+  Object.defineProperty(buildConfig, 'rollupOptions', {
+    get() {
+      return buildConfig.rolldownOptions
+    },
+    set(newValue) {
+      if (runtimeDeprecatedPath.has(path)) {
+        rollupOptionsDeprecationCall()
+      }
+      buildConfig.rolldownOptions = newValue
+    },
+    configurable: true,
+    enumerable: true,
+  })
+}
+
+const rollupOptionsRootPaths = new Set([
+  'build',
+  'worker',
+  'optimizeDeps',
+  'ssr.optimizeDeps',
+])
+
 /**
- * Dynamically import files. It will make sure it's not being compiled away by TS/Rollup.
- *
- * As a temporary workaround for Jest's lack of stable ESM support, we fallback to require
- * if we're in a Jest environment.
- * See https://github.com/vitejs/vite/pull/5197#issuecomment-938054077
- *
- * @param file File path to import.
+ * Sets up `rollupOptions` compat proxies for an environment.
  */
-export const dynamicImport = usingDynamicImport
-  ? new Function('file', 'return import(file)')
-  : require
+function setupRollupOptionCompatForEnvironment(environment: any): any {
+  if (!isObject(environment)) {
+    return environment
+  }
+  const merged: Record<string, any> = { ...environment }
+  if (isObject(merged.build)) {
+    setupRollupOptionCompat(merged.build, 'build')
+  }
+  return merged
+}
+
+export function hasBothRollupOptionsAndRolldownOptions(
+  options: Record<string, any>,
+): boolean {
+  for (const opt of [
+    options.build,
+    options.worker,
+    options.optimizeDeps,
+    options.ssr?.optimizeDeps,
+  ]) {
+    if (
+      opt != null &&
+      opt.rollupOptions != null &&
+      opt.rolldownOptions != null &&
+      // Check they are not just proxy values created by setupRollupOptionCompat
+      opt.rollupOptions !== opt.rolldownOptions
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
+const wsOptionKeys = [
+  'protocol',
+  'host',
+  'port',
+  'clientPort',
+  'path',
+  'timeout',
+  'server',
+] as const
+
+const hmrWsOptionsDeprecationCall = /* @__PURE__ */ (() => {
+  let logged = false
+  return () => {
+    if (logged) return
+    logged = true
+    const method = process.env.VITE_DEPRECATION_TRACE ? 'trace' : 'warn'
+    // eslint-disable-next-line no-console
+    console[method](
+      '`server.hmr.protocol/host/port/path/clientPort/timeout/server` is deprecated. ' +
+        'Use `server.ws.*` instead. Note that this option may be set by a plugin. ' +
+        (method === 'trace'
+          ? 'Showing trace because VITE_DEPRECATION_TRACE is set.'
+          : 'Set VITE_DEPRECATION_TRACE=1 to see where it is called.'),
+    )
+  }
+})()
+
+export function setupHmrWsOptionCompat(
+  serverConfig: Pick<ServerOptions, 'hmr' | 'ws'>,
+): void {
+  if (serverConfig.hmr === false || serverConfig.ws === false) {
+    return
+  }
+  if (serverConfig.hmr === true) {
+    serverConfig.hmr = {}
+  }
+
+  const hmrConfig = serverConfig.hmr
+  const wsConfig = serverConfig.ws ? { ...serverConfig.ws } : {}
+  if (hmrConfig) {
+    for (const key of wsOptionKeys) {
+      if (hmrConfig[key] !== undefined) {
+        // @ts-expect-error same value for same key
+        wsConfig[key] ??= hmrConfig[key]
+      }
+    }
+  }
+  serverConfig.ws = wsConfig
+
+  const hmrProxy = hmrConfig || {}
+  for (const key of wsOptionKeys) {
+    Object.defineProperty(hmrProxy, key, {
+      get() {
+        return (serverConfig.ws as Record<string, unknown>)?.[key]
+      },
+      set(newValue) {
+        hmrWsOptionsDeprecationCall()
+        if (typeof serverConfig.ws === 'object') {
+          ;(serverConfig.ws as Record<string, unknown>)[key] = newValue
+        }
+      },
+      configurable: true,
+      enumerable: true,
+    })
+  }
+  serverConfig.hmr = hmrProxy
+}
+
+function mergeConfigRecursively(
+  defaults: Record<string, any>,
+  overrides: Record<string, any>,
+  rootPath: string,
+) {
+  const merged: Record<string, any> = { ...defaults }
+  if (rollupOptionsRootPaths.has(rootPath)) {
+    setupRollupOptionCompat(merged, rootPath)
+  }
+  if (rootPath === 'server') {
+    setupHmrWsOptionCompat(merged)
+  }
+  if (rootPath === 'server.hmr') {
+    for (const key of wsOptionKeys) {
+      Object.defineProperty(
+        merged,
+        key,
+        Object.getOwnPropertyDescriptor(defaults, key)!,
+      )
+    }
+  }
+
+  for (const key in overrides) {
+    const value = overrides[key]
+    if (value == null) {
+      continue
+    }
+
+    let existing = merged[key]
+    if (key === 'rollupOptions' && rollupOptionsRootPaths.has(rootPath)) {
+      // if both rollupOptions and rolldownOptions are present,
+      // ignore rollupOptions and use rolldownOptions
+      if (overrides.rolldownOptions) continue
+      existing = merged.rolldownOptions
+    }
+
+    if (existing == null) {
+      if (rootPath === '' && key === 'environments' && isObject(value)) {
+        // Clone to avoid mutating the original override object
+        const environments = { ...value }
+        for (const envName in environments) {
+          environments[envName] = setupRollupOptionCompatForEnvironment(
+            environments[envName],
+          )
+        }
+        merged[key] = environments
+      } else if (rootPath === 'environments') {
+        // `environments` exists, but a new environment is added
+        merged[key] = setupRollupOptionCompatForEnvironment(value)
+      } else {
+        merged[key] = value
+      }
+      continue
+    }
+
+    // fields that require special handling
+    if (key === 'alias' && (rootPath === 'resolve' || rootPath === '')) {
+      merged[key] = mergeAlias(existing, value)
+      continue
+    } else if (key === 'assetsInclude' && rootPath === '') {
+      merged[key] = [].concat(existing, value)
+      continue
+    } else if (
+      (((key === 'noExternal' || key === 'external') &&
+        (rootPath === 'ssr' || rootPath === 'resolve')) ||
+        (key === 'allowedHosts' && rootPath === 'server')) &&
+      (existing === true || value === true)
+    ) {
+      merged[key] = true
+      continue
+    } else if (key === 'plugins' && rootPath === 'worker') {
+      merged[key] = () => [
+        ...backwardCompatibleWorkerPlugins(existing),
+        ...backwardCompatibleWorkerPlugins(value),
+      ]
+      continue
+    } else if (
+      key === 'server' &&
+      (rootPath === 'server.hmr' || rootPath === 'server.ws')
+    ) {
+      merged[key] = value
+      continue
+    }
+
+    if (Array.isArray(existing) || Array.isArray(value)) {
+      merged[key] = [...arraify(existing), ...arraify(value)]
+      continue
+    }
+    if (isObject(existing) && isObject(value)) {
+      merged[key] = mergeConfigRecursively(
+        existing,
+        value,
+        // treat environment.* as root
+        rootPath && !environmentPathRE.test(rootPath)
+          ? `${rootPath}.${key}`
+          : key,
+      )
+      continue
+    }
+
+    merged[key] = value
+  }
+  return merged
+}
+
+export function mergeConfig<
+  D extends Record<string, any>,
+  O extends Record<string, any>,
+>(
+  defaults: D extends Function ? never : D,
+  overrides: O extends Function ? never : O,
+  isRoot = true,
+): Record<string, any> {
+  if (typeof defaults === 'function' || typeof overrides === 'function') {
+    throw new Error(`Cannot merge config in form of callback`)
+  }
+
+  return mergeConfigRecursively(defaults, overrides, isRoot ? '' : '.')
+}
+
+export function mergeAlias(
+  a?: AliasOptions,
+  b?: AliasOptions,
+): AliasOptions | undefined {
+  if (!a) return b
+  if (!b) return a
+  if (isObject(a) && isObject(b)) {
+    return { ...a, ...b }
+  }
+  // the order is flipped because the alias is resolved from top-down,
+  // where the later should have higher priority
+  return [...normalizeAlias(b), ...normalizeAlias(a)]
+}
+
+export function normalizeAlias(o: AliasOptions = []): Alias[] {
+  return Array.isArray(o)
+    ? o.map(normalizeSingleAlias)
+    : Object.keys(o).map((find) =>
+        normalizeSingleAlias({
+          find,
+          replacement: (o as any)[find],
+        }),
+      )
+}
+
+// https://github.com/vitejs/vite/issues/1363
+// work around https://github.com/rollup/plugins/issues/759
+function normalizeSingleAlias({
+  find,
+  replacement,
+  customResolver,
+}: Alias): Alias {
+  if (
+    typeof find === 'string' &&
+    find.endsWith('/') &&
+    replacement.endsWith('/')
+  ) {
+    find = find.slice(0, find.length - 1)
+    replacement = replacement.slice(0, replacement.length - 1)
+  }
+
+  const alias: Alias = {
+    find,
+    replacement,
+  }
+  if (customResolver) {
+    alias.customResolver = customResolver
+  }
+  return alias
+}
+
+/**
+ * Transforms transpiled code result where line numbers aren't altered,
+ * so we can skip sourcemap generation during dev
+ */
+export function transformStableResult(
+  s: MagicString,
+  id: string,
+  config: ResolvedConfig,
+): TransformResult {
+  return {
+    code: s.toString(),
+    map:
+      config.command === 'build' && config.build.sourcemap
+        ? s.generateMap({ hires: 'boundary', source: id })
+        : null,
+  }
+}
+
+type AsyncFlatten<T extends unknown[]> = T extends (infer U)[]
+  ? Exclude<Awaited<U>, U[]>[]
+  : never
+
+export async function asyncFlatten<T extends unknown[]>(
+  arr: T,
+): Promise<AsyncFlatten<T>> {
+  do {
+    arr = (await Promise.all(arr)).flat(Infinity) as any
+  } while (arr.some((v: any) => v?.then))
+  return arr as unknown[] as AsyncFlatten<T>
+}
+
+// strip UTF-8 BOM
+export function stripBomTag(content: string): string {
+  if (content.charCodeAt(0) === 0xfeff) {
+    return content.slice(1)
+  }
+
+  return content
+}
+
+/**
+ * Determine if a file is being requested with the correct case, to ensure
+ * consistent behavior between dev and prod and across operating systems.
+ */
+export function shouldServeFile(filePath: string, root: string): boolean {
+  // can skip case check on Linux
+  if (!isCaseInsensitiveFS) return true
+
+  return hasCorrectCase(filePath, root)
+}
+
+/**
+ * Note that we can't use realpath here, because we don't want to follow
+ * symlinks.
+ */
+function hasCorrectCase(file: string, assets: string): boolean {
+  if (file === assets) return true
+
+  const parent = path.dirname(file)
+
+  if (fs.readdirSync(parent).includes(path.basename(file))) {
+    return hasCorrectCase(parent, assets)
+  }
+
+  return false
+}
+
+export function joinUrlSegments(a: string, b: string): string {
+  if (!a || !b) {
+    return a || b || ''
+  }
+  if (a.endsWith('/')) {
+    a = a.substring(0, a.length - 1)
+  }
+  if (b[0] !== '/') {
+    b = '/' + b
+  }
+  return a + b
+}
+
+export function removeLeadingSlash(str: string): string {
+  return str[0] === '/' ? str.slice(1) : str
+}
+
+export function stripBase(path: string, base: string): string {
+  if (path === base) {
+    return '/'
+  }
+  const devBase = withTrailingSlash(base)
+  return path.startsWith(devBase) ? path.slice(devBase.length - 1) : path
+}
+
+export function arrayEqual(a: any[], b: any[]): boolean {
+  if (a === b) return true
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false
+  }
+  return true
+}
+
+export function evalValue<T = any>(rawValue: string): T {
+  const fn = new Function(`
+    var console, exports, global, module, process, require
+    return (\n${rawValue}\n)
+  `)
+  return fn()
+}
+
+export function getNpmPackageName(importPath: string): string | null {
+  const parts = importPath.split('/')
+  if (parts[0][0] === '@') {
+    if (!parts[1]) return null
+    return `${parts[0]}/${parts[1]}`
+  } else {
+    return parts[0]
+  }
+}
+
+export function getPkgName(name: string): string | undefined {
+  return name[0] === '@' ? name.split('/')[1] : name
+}
+
+const escapeRegexRE = /[-/\\^$*+?.()|[\]{}]/g
+export function escapeRegex(str: string): string {
+  return str.replace(escapeRegexRE, '\\$&')
+}
+
+type CommandType = 'install' | 'uninstall' | 'update'
+export function getPackageManagerCommand(
+  type: CommandType = 'install',
+): string {
+  const packageManager =
+    process.env.npm_config_user_agent?.split(' ')[0].split('/')[0] || 'npm'
+  switch (type) {
+    case 'install':
+      return packageManager === 'npm' ? 'npm install' : `${packageManager} add`
+    case 'uninstall':
+      return packageManager === 'npm'
+        ? 'npm uninstall'
+        : `${packageManager} remove`
+    case 'update':
+      return packageManager === 'yarn'
+        ? 'yarn upgrade'
+        : `${packageManager} update`
+    default:
+      throw new TypeError(`Unknown command type: ${type}`)
+  }
+}
+
+export function isDevServer(
+  server: ViteDevServer | PreviewServer,
+): server is ViteDevServer {
+  return 'pluginContainer' in server
+}
+
+export function createSerialPromiseQueue<T>(): {
+  run(f: () => Promise<T>): Promise<T>
+} {
+  let previousTask: Promise<[unknown, Awaited<T>]> | undefined
+
+  return {
+    async run(f) {
+      const thisTask = f()
+      // wait for both the previous task and this task
+      // so that this function resolves in the order this function is called
+      const depTasks = Promise.all([previousTask, thisTask])
+      previousTask = depTasks
+
+      const [, result] = await depTasks
+
+      // this task was the last one, clear `previousTask` to free up memory
+      if (previousTask === depTasks) {
+        previousTask = undefined
+      }
+
+      return result
+    },
+  }
+}
+
+export function sortObjectKeys<T extends Record<string, any>>(obj: T): T {
+  const sorted: Record<string, any> = {}
+  for (const key of Object.keys(obj).sort()) {
+    sorted[key] = obj[key]
+  }
+  return sorted as T
+}
+
+export function displayTime(time: number): string {
+  // display: {X}ms
+  if (time < 1000) {
+    return `${time}ms`
+  }
+
+  time = time / 1000
+
+  // display: {X}s
+  if (time < 60) {
+    return `${time.toFixed(2)}s`
+  }
+
+  // Calculate total minutes and remaining seconds
+  const mins = Math.floor(time / 60)
+  const seconds = Math.round(time % 60)
+
+  // Handle case where seconds rounds to 60
+  if (seconds === 60) {
+    return `${mins + 1}m`
+  }
+
+  // display: {X}m {Y}s
+  return `${mins}m${seconds < 1 ? '' : ` ${seconds}s`}`
+}
+
+/**
+ * Encodes the URI path portion (ignores part after ? or #)
+ */
+export function encodeURIPath(uri: string): string {
+  if (uri.startsWith('data:')) return uri
+  const filePath = cleanUrl(uri)
+  const postfix = filePath !== uri ? uri.slice(filePath.length) : ''
+  return encodeURI(filePath) + postfix
+}
+
+/**
+ * Like `encodeURIPath`, but only replacing `%` as `%25`. This is useful for environments
+ * that can handle un-encoded URIs, where `%` is the only ambiguous character.
+ */
+export function partialEncodeURIPath(uri: string): string {
+  if (uri.startsWith('data:')) return uri
+  const filePath = cleanUrl(uri)
+  const postfix = filePath !== uri ? uri.slice(filePath.length) : ''
+  return filePath.replaceAll('%', '%25') + postfix
+}
+
+export function decodeURIIfPossible(input: string): string | undefined {
+  try {
+    return decodeURI(input)
+  } catch {
+    // url is malformed, probably a interpolate syntax of template engines
+    return
+  }
+}
+
+type SigtermCallback = (signal?: 'SIGTERM', exitCode?: number) => Promise<void>
+
+// Use a shared callback when attaching sigterm listeners to avoid `MaxListenersExceededWarning`
+const sigtermCallbacks = new Set<SigtermCallback>()
+const parentSigtermCallback: SigtermCallback = async (signal, exitCode) => {
+  await Promise.all([...sigtermCallbacks].map((cb) => cb(signal, exitCode)))
+}
+
+export const setupSIGTERMListener = (
+  callback: (signal?: 'SIGTERM', exitCode?: number) => Promise<void>,
+): void => {
+  if (sigtermCallbacks.size === 0) {
+    process.once('SIGTERM', parentSigtermCallback)
+    if (process.env.CI !== 'true') {
+      process.stdin.on('end', parentSigtermCallback)
+    }
+  }
+  sigtermCallbacks.add(callback)
+}
+
+export const teardownSIGTERMListener = (
+  callback: Parameters<typeof setupSIGTERMListener>[0],
+): void => {
+  sigtermCallbacks.delete(callback)
+  if (sigtermCallbacks.size === 0) {
+    process.off('SIGTERM', parentSigtermCallback)
+    if (process.env.CI !== 'true') {
+      process.stdin.off('end', parentSigtermCallback)
+    }
+  }
+}
+
+export function getServerUrlByHost(
+  resolvedUrls: ResolvedServerUrls | null,
+  host: CommonServerOptions['host'],
+): string | undefined {
+  if (typeof host === 'string') {
+    const matchedUrl = [
+      ...(resolvedUrls?.local ?? []),
+      ...(resolvedUrls?.network ?? []),
+    ].find((url) => url.includes(host))
+    if (matchedUrl) {
+      return matchedUrl
+    }
+  }
+  return resolvedUrls?.local[0] ?? resolvedUrls?.network[0]
+}
+
+let lastDateNow = 0
+/**
+ * Similar to `Date.now()`, but strictly monotonically increasing.
+ *
+ * This function will never return the same value.
+ * Thus, the value may differ from the actual time.
+ *
+ * related: https://github.com/vitejs/vite/issues/19804
+ */
+export function monotonicDateNow(): number {
+  const now = Date.now()
+  if (now > lastDateNow) {
+    lastDateNow = now
+    return lastDateNow
+  }
+
+  lastDateNow++
+  return lastDateNow
+}
+
+export function formatAndTruncateFileList(files: string[]): {
+  formatted: string
+  truncated: boolean
+} {
+  const MAX_LOG_LENGTH = 500
+  let log = ''
+  let truncated = false
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i]
+    if (log === '') {
+      log = file
+    } else if (log.length + 2 + file.length < MAX_LOG_LENGTH) {
+      log += ', ' + file
+    } else {
+      log += ` and ${files.length - i} more`
+      truncated = true
+      break
+    }
+  }
+  return { formatted: log, truncated }
+}
+
+const hashbangRE = /^#!.*\n/
+
+// find the start of the file, after the hashbang
+export function getFileStartIndex(code: string): number {
+  return hashbangRE.exec(code)?.[0].length ?? 0
+}

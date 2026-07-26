@@ -1,77 +1,302 @@
-import { ResolvedConfig } from '../config'
-import { Plugin } from '../plugin'
-import aliasPlugin from '@rollup/plugin-alias'
-import { jsonPlugin } from './json'
-import { resolvePlugin } from './resolve'
-import { esbuildPlugin } from './esbuild'
+import aliasPlugin, { type ResolverFunction } from '@rollup/plugin-alias'
+import colors from 'picocolors'
+import type { ObjectHook } from 'rolldown'
+import {
+  viteAliasPlugin as nativeAliasPlugin,
+  viteJsonPlugin as nativeJsonPlugin,
+  oxcRuntimePlugin,
+} from 'rolldown/experimental'
+import type { PluginHookUtils, ResolvedConfig } from '../config'
+import {
+  type HookHandler,
+  type Plugin,
+  type PluginWithRequiredHook,
+} from '../plugin'
+import { watchPackageDataPlugin } from '../packages'
+import { resolveBuildPlugins } from '../build'
+import { oxcResolvePlugin } from './resolve'
+import { optimizedDepsPlugin } from './optimizedDeps'
 import { importAnalysisPlugin } from './importAnalysis'
-import { cssPlugin, cssPostPlugin } from './css'
+import { cssAnalysisPlugin, cssPlugin, cssPostPlugin } from './css'
 import { assetPlugin } from './asset'
 import { clientInjectionsPlugin } from './clientInjections'
-import { htmlInlineScriptProxyPlugin } from './html'
-import { wasmPlugin } from './wasm'
+import { buildHtmlPlugin, htmlInlineProxyPlugin } from './html'
+import { wasmHelperPlugin } from './wasm'
 import { modulePreloadPolyfillPlugin } from './modulePreloadPolyfill'
 import { webWorkerPlugin } from './worker'
 import { preAliasPlugin } from './preAlias'
 import { definePlugin } from './define'
-import { ssrRequireHookPlugin } from './ssrRequireHook'
+import { workerImportMetaUrlPlugin } from './workerImportMetaUrl'
+import { assetImportMetaUrlPlugin } from './assetImportMetaUrl'
+import { dynamicImportVarsPlugin } from './dynamicImportVars'
+import { importGlobPlugin } from './importMetaGlob'
+import {
+  type PluginFilter,
+  type TransformHookFilter,
+  createFilterForTransform,
+  createIdFilter,
+} from './pluginFilter'
+import { forwardConsolePlugin } from './forwardConsole'
+import { oxcPlugin } from './oxc'
+import { esbuildBannerFooterCompatPlugin } from './esbuildBannerFooterCompatPlugin'
 
 export async function resolvePlugins(
   config: ResolvedConfig,
   prePlugins: Plugin[],
   normalPlugins: Plugin[],
-  postPlugins: Plugin[]
+  postPlugins: Plugin[],
 ): Promise<Plugin[]> {
   const isBuild = config.command === 'build'
-
-  const buildPlugins = isBuild
-    ? (await import('../build')).resolveBuildPlugins(config)
+  const isWorker = config.isWorker
+  const anyEnvBundled =
+    isBuild || Object.values(config.environments).some((env) => env.isBundled)
+  const buildPlugins = anyEnvBundled
+    ? resolveBuildPlugins(config)
     : { pre: [], post: [] }
+  const devtoolsIntegrationPlugin =
+    config.devtools.enabled && !isWorker
+      ? await loadDevToolsIntegrationPlugin(config)
+      : null
+  const { modulePreload } = config.build
 
   return [
-    isBuild ? null : preAliasPlugin(),
-    aliasPlugin({
-      entries: config.resolve.alias,
-      customResolver: function (this, updatedId, importer) {
-        return this.resolve(updatedId, importer, { skipSelf: true })
-      }
-    }),
-    ...prePlugins,
-    config.build.polyfillModulePreload
-      ? modulePreloadPolyfillPlugin(config)
-      : null,
-    resolvePlugin({
-      ...config.resolve,
-      root: config.root,
-      isProduction: config.isProduction,
-      isBuild,
-      packageCache: config.packageCache,
-      ssrConfig: config.ssr,
-      asSrc: true
-    }),
-    config.build.ssr ? ssrRequireHookPlugin(config) : null,
-    htmlInlineScriptProxyPlugin(config),
-    cssPlugin(config),
-    config.esbuild !== false ? esbuildPlugin(config.esbuild) : null,
-    jsonPlugin(
-      {
-        namedExports: true,
-        ...config.json
+    optimizedDepsPlugin(),
+    !isWorker ? watchPackageDataPlugin(config.packageCache) : null,
+    preAliasPlugin(config),
+    {
+      ...aliasPlugin({
+        // @ts-expect-error aliasPlugin receives rollup types
+        entries: config.resolve.alias,
+        customResolver: viteAliasCustomResolver,
+      }),
+      applyToEnvironment(environment) {
+        if (
+          environment.config.isBundled &&
+          !environment.config.resolve.alias.some((v) => v.customResolver)
+        ) {
+          return nativeAliasPlugin({
+            entries: config.resolve.alias.map((item) => {
+              return {
+                find: item.find,
+                replacement: item.replacement,
+              }
+            }),
+          })
+        }
+        return true
       },
-      isBuild
+    } as Plugin,
+
+    ...prePlugins,
+
+    modulePreload !== false && modulePreload.polyfill
+      ? modulePreloadPolyfillPlugin()
+      : null,
+    ...oxcResolvePlugin(
+      {
+        root: config.root,
+        isProduction: config.isProduction,
+        isBuild,
+        packageCache: config.packageCache,
+        asSrc: true,
+        optimizeDeps: true,
+        externalize: true,
+        legacyInconsistentCjsInterop: config.legacy?.inconsistentCjsInterop,
+      },
+      isWorker
+        ? {
+            ...config,
+            consumer: 'client',
+            isBundled: true,
+            optimizeDepsPluginNames: [],
+          }
+        : undefined,
     ),
-    wasmPlugin(config),
+    htmlInlineProxyPlugin(config),
+    cssPlugin(config),
+    esbuildBannerFooterCompatPlugin(config),
+    // @oxc-project/runtime resolution is handled by rolldown in build
+    config.oxc !== false
+      ? ({
+          ...oxcRuntimePlugin(),
+          applyToEnvironment(environment) {
+            return !environment.config.isBundled
+          },
+        } satisfies Plugin)
+      : null,
+    config.oxc !== false ? oxcPlugin(config) : null,
+    nativeJsonPlugin({ ...config.json, minify: isBuild }),
+    wasmHelperPlugin(),
     webWorkerPlugin(config),
     assetPlugin(config),
+    // for now client only
+    config.server.forwardConsole.enabled &&
+      forwardConsolePlugin({ environments: ['client'] }),
+
     ...normalPlugins,
+
     definePlugin(config),
     cssPostPlugin(config),
+    buildHtmlPlugin(config),
+    workerImportMetaUrlPlugin(config),
+    assetImportMetaUrlPlugin(config),
     ...buildPlugins.pre,
+    dynamicImportVarsPlugin(config),
+    importGlobPlugin(config),
+
     ...postPlugins,
+
     ...buildPlugins.post,
+    devtoolsIntegrationPlugin,
+
     // internal server-only plugins are always applied after everything else
-    ...(isBuild
-      ? []
-      : [clientInjectionsPlugin(config), importAnalysisPlugin(config)])
+    clientInjectionsPlugin(config),
+    cssAnalysisPlugin(config),
+    importAnalysisPlugin(config),
   ].filter(Boolean) as Plugin[]
+}
+
+async function loadDevToolsIntegrationPlugin(
+  config: ResolvedConfig,
+): Promise<Plugin | null> {
+  try {
+    const { DevToolsIntegration } = await import('@vitejs/devtools/integration')
+    return DevToolsIntegration({ config })
+  } catch (error: any) {
+    config.logger.error(
+      colors.red(
+        `Failed to load Vite DevTools integration: ${error?.message || error?.stack}`,
+      ),
+      { error },
+    )
+    return null
+  }
+}
+
+export function createPluginHookUtils(
+  plugins: readonly Plugin[],
+): PluginHookUtils {
+  // sort plugins per hook
+  const sortedPluginsCache = new Map<keyof Plugin, Plugin[]>()
+  function getSortedPlugins<K extends keyof Plugin>(
+    hookName: K,
+  ): PluginWithRequiredHook<K>[] {
+    if (sortedPluginsCache.has(hookName))
+      return sortedPluginsCache.get(hookName) as PluginWithRequiredHook<K>[]
+    const sorted = getSortedPluginsByHook(hookName, plugins)
+    sortedPluginsCache.set(hookName, sorted)
+    return sorted
+  }
+  function getSortedPluginHooks<K extends keyof Plugin>(
+    hookName: K,
+  ): NonNullable<HookHandler<Plugin[K]>>[] {
+    const plugins = getSortedPlugins(hookName)
+    return plugins.map((p) => getHookHandler(p[hookName])).filter(Boolean)
+  }
+
+  return {
+    getSortedPlugins,
+    getSortedPluginHooks,
+  }
+}
+
+export function getSortedPluginsByHook<K extends keyof Plugin>(
+  hookName: K,
+  plugins: readonly Plugin[],
+): PluginWithRequiredHook<K>[] {
+  const sortedPlugins: Plugin[] = []
+  // Use indexes to track and insert the ordered plugins directly in the
+  // resulting array to avoid creating 3 extra temporary arrays per hook
+  let pre = 0,
+    normal = 0,
+    post = 0
+  for (const plugin of plugins) {
+    const hook = plugin[hookName]
+    if (hook) {
+      if (typeof hook === 'object') {
+        if (hook.order === 'pre') {
+          sortedPlugins.splice(pre++, 0, plugin)
+          continue
+        }
+        if (hook.order === 'post') {
+          sortedPlugins.splice(pre + normal + post++, 0, plugin)
+          continue
+        }
+      }
+      sortedPlugins.splice(pre + normal++, 0, plugin)
+    }
+  }
+
+  return sortedPlugins as PluginWithRequiredHook<K>[]
+}
+
+export function getHookHandler<T extends ObjectHook<Function>>(
+  hook: T,
+): HookHandler<T> {
+  return (typeof hook === 'object' ? hook.handler : hook) as HookHandler<T>
+}
+
+type FilterForPluginValue = {
+  resolveId?: PluginFilter | undefined
+  load?: PluginFilter | undefined
+  transform?: TransformHookFilter | undefined
+}
+const filterForPlugin = new WeakMap<Plugin, FilterForPluginValue>()
+
+export function getCachedFilterForPlugin<
+  H extends 'resolveId' | 'load' | 'transform',
+>(plugin: Plugin, hookName: H): FilterForPluginValue[H] | undefined {
+  let filters = filterForPlugin.get(plugin)
+  if (filters && hookName in filters) {
+    return filters[hookName]
+  }
+
+  if (!filters) {
+    filters = {}
+    filterForPlugin.set(plugin, filters)
+  }
+
+  let filter: PluginFilter | TransformHookFilter | undefined
+  switch (hookName) {
+    case 'resolveId': {
+      const rawFilter = extractFilter(plugin.resolveId)?.id
+      filters.resolveId = createIdFilter(rawFilter)
+      filter = filters.resolveId
+      break
+    }
+    case 'load': {
+      const rawFilter = extractFilter(plugin.load)?.id
+      filters.load = createIdFilter(rawFilter)
+      filter = filters.load
+      break
+    }
+    case 'transform': {
+      const rawFilters = extractFilter(plugin.transform)
+      filters.transform = createFilterForTransform(
+        rawFilters?.id,
+        rawFilters?.code,
+        rawFilters?.moduleType,
+      )
+      filter = filters.transform
+      break
+    }
+  }
+  return filter as FilterForPluginValue[H] | undefined
+}
+
+function extractFilter<T extends Function, F>(
+  hook: ObjectHook<T, { filter?: F }> | undefined,
+) {
+  return hook && 'filter' in hook && hook.filter ? hook.filter : undefined
+}
+
+// Same as `@rollup/plugin-alias` default resolver, but we attach additional meta
+// if we can't resolve to something, which will error in `importAnalysis`
+export const viteAliasCustomResolver: ResolverFunction = async function (
+  id,
+  importer,
+  options,
+) {
+  const resolved = await this.resolve(id, importer, options)
+  return resolved || { id, meta: { 'vite:alias': { noResolved: true } } }
 }
