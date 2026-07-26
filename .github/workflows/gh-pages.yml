@@ -28,9 +28,13 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
+      # --force: @oxc-transform/binding-wasm32-wasi declares cpu:["wasm32"],
+      # which makes npm abort with EBADPLATFORM on the x64 runner. The binding
+      # is only consumed through a vendored browser alias (never via its native
+      # loader), so overriding the platform check is safe.
       - name: Install dependencies
         working-directory: example
-        run: npm ci
+        run: npm ci --force
       - name: Build
         working-directory: example
         env:
