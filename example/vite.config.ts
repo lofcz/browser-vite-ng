@@ -13,7 +13,10 @@ import { iframeRuntimePlugin } from './vite-plugin-iframe-runtime';
  * canonical name and every public subpath export (fs/promises, etc.) are kept.
  */
 const EXAMPLE_NODE_MODULES = path.resolve(__dirname, 'node_modules');
-const FORK_SRC = path.resolve(__dirname, '../packages/vite/src');
+// Normalized to forward slashes — importers may arrive POSIX-ified by the
+// bundler even on Windows, so a raw path.resolve() prefix match would fail.
+const FORK_SRC = path.resolve(__dirname, '../packages/vite/src').replace(/\\/g, '/');
+const toPosix = (p: string) => p.replace(/\\/g, '/');
 
 /**
  * The browser-vite fork is aliased to its TypeScript source under
@@ -29,7 +32,7 @@ function forkDepsPlugin(): Plugin {
     name: 'fork-deps',
     enforce: 'pre',
     async resolveId(id, importer) {
-      if (!importer || !importer.startsWith(FORK_SRC)) return null;
+      if (!importer || !toPosix(importer).startsWith(FORK_SRC)) return null;
       if (id.startsWith('.') || id.startsWith('/') || id.startsWith('\0')) return null;
       if (id.startsWith('node:')) return null;
       const resolved = await this.resolve(id, EXAMPLE_NODE_MODULES + '/x.js', {
@@ -111,6 +114,19 @@ export default defineConfig({
       '@oxc-transform/binding-wasm32-wasi',
       'browser-vite',
       'rolldown',
+    ],
+    // browser-vite is excluded above, so its deps (@zenfs/core and below)
+    // would be served raw without CJS interop. Pre-bundle @zenfs/core so
+    // esbuild interops its CJS deps (buffer, eventemitter3, readable-stream,
+    // utilium, kerium, memium) internally.
+    include: [
+      '@zenfs/core',
+      'eventemitter3',
+      'buffer',
+      'readable-stream',
+      'utilium',
+      'kerium',
+      'memium',
     ],
   },
   worker: {

@@ -18,6 +18,7 @@
     "@napi-rs/wasm-runtime": "^1.1.6",
     "@oxc-transform/binding-wasm32-wasi": "^0.108.0",
     "@tailwindcss/vite": "^4.1.18",
+    "@zenfs/core": "^2.6.1",
     "chii": "^1.15.5",
     "chobitsu": "^1.8.6",
     "cjs-module-lexer": "^2.2.0",

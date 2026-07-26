@@ -82,6 +82,7 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
+    "@zenfs/core": "^2.6.1",
     "es-module-lexer": "^2.3.1",
     "lightningcss": "^1.32.0",
     "oxc-transform": "^0.108.0",
