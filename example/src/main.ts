@@ -13,6 +13,7 @@ import './index.css';
 import { EditorView, basicSetup } from 'codemirror';
 import { javascript } from '@codemirror/lang-javascript';
 import { css } from '@codemirror/lang-css';
+import { html } from '@codemirror/lang-html';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { EditorState } from '@codemirror/state';
 import { BrowserVite } from './browser-vite-wrapper';
@@ -39,11 +40,43 @@ import {
 interface VirtualFile {
   path: string;
   content: string;
-  type: 'tsx' | 'ts' | 'css' | 'json';
+  type: 'tsx' | 'ts' | 'css' | 'json' | 'html';
 }
 
 // Initial file system with a multi-file React app
 const initialFiles: VirtualFile[] = [
+  {
+    path: '/index.html',
+    type: 'html',
+    content: `<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Browser-Vite Demo</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+`,
+  },
+  {
+    path: '/src/main.tsx',
+    type: 'tsx',
+    content: `// Entry module — renders the app into #root (real Vite scaffold shape).
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import App from './App';
+
+createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+`,
+  },
   {
     path: '/src/App.tsx',
     type: 'tsx',
@@ -256,7 +289,7 @@ button:active {
 
 // Virtual file system state
 let fileSystem: Map<string, VirtualFile> = new Map();
-let currentFile: string = '/src/App.tsx';
+let currentFile: string = '/index.html';
 let modifiedFiles: Set<string> = new Set();
 
 // Initialize file system
@@ -442,6 +475,7 @@ function getFileIcon(filename: string): string {
   if (filename.endsWith('.ts')) return '📘';
   if (filename.endsWith('.css')) return '🎨';
   if (filename.endsWith('.json')) return '📋';
+  if (filename.endsWith('.html')) return '🌐';
   return '📄';
 }
 
@@ -486,7 +520,14 @@ function renderFileTree() {
     }
   }
 
-  for (const node of tree) {
+  // Root level: files first (index.html, package.json), then folders (src/) —
+  // real Vite projects keep these at the project root, shown above src/.
+  const sortedRoot = [...tree].sort((a, b) => {
+    if (!a.isFolder && b.isFolder) return -1;
+    if (a.isFolder && !b.isFolder) return 1;
+    return a.name.localeCompare(b.name);
+  });
+  for (const node of sortedRoot) {
     renderNode(node, fileTreeEl);
   }
 }
@@ -495,11 +536,12 @@ function renderFileTree() {
 // Editor
 // =============================================================================
 
-function getFileType(path: string): 'tsx' | 'ts' | 'css' | 'json' {
+function getFileType(path: string): 'tsx' | 'ts' | 'css' | 'json' | 'html' {
   if (path.endsWith('.tsx')) return 'tsx';
   if (path.endsWith('.ts')) return 'ts';
   if (path.endsWith('.css')) return 'css';
   if (path.endsWith('.json')) return 'json';
+  if (path.endsWith('.html')) return 'html';
   return 'ts';
 }
 
@@ -530,7 +572,11 @@ function openFile(path: string) {
   }
 
   const languageExtension =
-    fileType === 'css' ? css() : javascript({ jsx: fileType === 'tsx', typescript: true });
+    fileType === 'css'
+      ? css()
+      : fileType === 'html'
+        ? html()
+        : javascript({ jsx: fileType === 'tsx', typescript: true });
 
   editor = new EditorView({
     state: EditorState.create({
@@ -584,6 +630,11 @@ async function prepareModules(entry: string): Promise<string> {
 /**
  * Preview iframe with Vite HotPayload client (full HMRClient semantics).
  * Host sends { type: 'vite-hmr', payload } — same shapes as Vite 8 WebSocket.
+ *
+ * The document is built from the project's REAL /index.html (its <title>,
+ * <meta>, and <body> content are honored), with the HMR runtime module +
+ * error-overlay styles injected — the analogue of Vite injecting /@vite/client
+ * into your HTML at dev time.
  */
 function createHMRRuntime(): string {
   // Precompiled modules (plain JS). Blob-serve client + lexer, expose their
@@ -595,7 +646,10 @@ function createHMRRuntime(): string {
 ${iframeRuntimeJs}
   `;
 
-  return createViteHmrIframeHtml(clientBootstrap);
+  const indexHtml =
+    fileSystem.get('/index.html')?.content ??
+    '<!doctype html><html><head><meta charset="UTF-8"></head><body><div id="root"></div></body></html>';
+  return createViteHmrIframeHtml(indexHtml, clientBootstrap);
 }
 
 // =============================================================================
@@ -624,15 +678,32 @@ async function syncFilesToBrowserVite() {
   }
 }
 
+/**
+ * Read the entry module from the project's real /index.html — the
+ * `<script type="module" src="...">` a real Vite project uses. Falls back to
+ * /src/main.tsx when absent. Parsed via DOMParser (no regex on HTML).
+ */
+function getEntryFromIndexHtml(): string {
+  const html = fileSystem.get('/index.html')?.content;
+  if (html) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const src = doc.querySelector('script[type="module"]')?.getAttribute('src');
+    if (src) return src.startsWith('/') ? src : '/' + src;
+  }
+  log('No <script type="module"> in /index.html — falling back to /src/main.tsx', 'warn');
+  return '/src/main.tsx';
+}
+
 /** Initial / full bootstrap: serve the entry as real ESM into the iframe. */
 async function bootstrapPreview() {
   if (!browserVite || !iframeReady) return;
-  const entry = await prepareModules('/src/App.tsx');
+  const entryPath = getEntryFromIndexHtml();
+  const entry = await prepareModules(entryPath);
   previewFrame.contentWindow?.postMessage(
-    { type: 'hmr-update', entry, fileType: 'tsx' },
+    { type: 'hmr-update', entry, fileType: getFileType(entry) },
     '*',
   );
-  log('Bootstrap entry sent to iframe (real ESM serving)', 'hmr');
+  log(`Bootstrap entry sent to iframe (real ESM serving): ${entry}`, 'hmr');
 }
 
 /**
@@ -658,6 +729,14 @@ async function updatePreview() {
   const currentType = getFileType(currentFile);
   if (currentType === 'json') {
     log('package.json changed — click Install to apply dependency changes', 'warn');
+    return;
+  }
+  // index.html is not an HMR module — like real Vite, a change triggers a
+  // full reload. The browser-vite server sends `full-reload`; the host honors
+  // it by rebuilding the iframe document from the LATEST VFS index.html (the
+  // analogue of the dev server re-serving the page) and re-bootstrapping.
+  if (currentType === 'html') {
+    log('index.html changed — full reload (rebuild document + re-bootstrap)', 'hmr');
     return;
   }
 
@@ -833,6 +912,12 @@ window.addEventListener('message', async (event) => {
     }
   } else if (event.data?.type === 'hmr-full-reload-ack') {
     log('Client acknowledged full-reload', 'hmr');
+  } else if (event.data?.type === 'hmr-request-reload') {
+    // Real Vite reload → dev server re-serves the CURRENT page. Here the host
+    // rebuilds the iframe document from the latest VFS index.html and
+    // re-bootstraps the entry it declares.
+    log('Full reload — rebuilding iframe from latest index.html', 'hmr');
+    initIframe();
   } else if (event.data?.type === 'cdp-ready') {
     cdpReady = true;
     log('CDP (Chobitsu) ready - Click DevTools to open Chrome DevTools', 'success');
@@ -1017,8 +1102,8 @@ async function initialize() {
       });
     });
 
-    // Open the main App file
-    openFile('/src/App.tsx');
+    // Open the project's real entry document
+    openFile('/index.html');
 
     // Install dependencies (real npm registry -> VFS -> esbuild-wasm), then
     // bring up the preview once the optimized deps manifest is available.

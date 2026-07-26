@@ -12,31 +12,6 @@
 
 declare const chobitsu: { setOnMessage(cb: (m: string) => void): void; sendRawMessage(m: string): void } | undefined;
 
-interface ReactLike {
-  createElement(...args: unknown[]): unknown;
-}
-interface ReactDomLike {
-  createRoot(el: Element | null): { render(node: unknown): void };
-}
-
-// React / ReactDOM come from the SAME optimized-dep blob URLs the transformed
-// component modules import (the deps optimizer code-splits so all entries
-// share ONE React instance). Loaded lazily via the normal serve path.
-let reactPromise: Promise<ReactLike> | null = null;
-let reactDomPromise: Promise<ReactDomLike> | null = null;
-async function loadReact(): Promise<ReactLike> {
-  if (!reactPromise)
-    reactPromise = import(/* @vite-ignore */ await serveModule('/@deps/react.js')) as Promise<ReactLike>;
-  return reactPromise;
-}
-async function loadReactDom(): Promise<ReactDomLike> {
-  if (!reactDomPromise)
-    reactDomPromise = import(
-      /* @vite-ignore */ await serveModule('/@deps/react-dom__client.js')
-    ) as Promise<ReactDomLike>;
-  return reactDomPromise;
-}
-
 interface HotUpdate {
   type: 'js-update' | 'css-update';
   timestamp: number;
@@ -98,7 +73,6 @@ const pruneMap = new Map<string, (data: unknown) => void | Promise<void>>();
 const dataMap = new Map<string, unknown>();
 const blobUrls = new Map<string, string>();
 
-let reactRoot: { render(node: unknown): void } | null = null;
 let updateCount = 0;
 
 let lexerPromise: Promise<Lexer> | null = null;
@@ -307,23 +281,6 @@ function clearErrorOverlay(): void {
   document.documentElement.style.overflow = '';
 }
 
-async function renderApp(AppComponent: unknown): Promise<void> {
-  try {
-    const [React, ReactDOM] = await Promise.all([loadReact(), loadReactDom()]);
-    if (!reactRoot) {
-      reactRoot = ReactDOM.createRoot(document.getElementById('root'));
-      hmrLog('Created new React root');
-    }
-    reactRoot.render(React.createElement(AppComponent as never));
-    clearErrorOverlay();
-    hmrLog('Rendered component (update #' + updateCount + ')');
-  } catch (err) {
-    const e = err as Error;
-    hmrLog('Render error: ' + e.message);
-    showErrorOverlay('Render Error', e.message, e.stack);
-  }
-}
-
 async function applyJsUpdate(update: HotUpdate): Promise<void> {
   const { path, acceptedPath, timestamp } = update;
   hmrLog(`js-update path=${path} acceptedPath=${acceptedPath} t=${timestamp}`);
@@ -387,7 +344,11 @@ async function handlePayload(payload: Payload): Promise<void> {
     case 'full-reload':
       hmrLog('full-reload' + (payload.path ? ' path=' + payload.path : ''));
       post('hmr-full-reload-ack', { path: payload.path });
-      location.reload();
+      // The iframe document is a blob URL frozen at creation time — a plain
+      // location.reload() would re-serve the STALE html. Ask the host to rebuild
+      // the document from the latest VFS index.html (the analogue of the dev
+      // server re-serving the page on reload).
+      post('hmr-request-reload');
       break;
     case 'prune':
       hmrLog('prune ' + (payload.paths || []).join(', '));
@@ -426,9 +387,12 @@ window.addEventListener('message', async (event: MessageEvent) => {
     hmrLog('Received bootstrap entry #' + updateCount);
     try {
       await installRefreshPreamble();
-      const entry = event.data.entry || '/src/App.tsx';
-      const mod = await import(await serveModule(entry));
-      if (mod && mod.default) renderApp(mod.default);
+      // The entry (e.g. /src/main.tsx, declared by /index.html) is
+      // self-executing: it imports react-dom/client and calls
+      // createRoot().render() itself — exactly like a real Vite scaffold. The
+      // runtime no longer renders the entry's default export.
+      const entry = event.data.entry || '/src/main.tsx';
+      await import(await serveModule(entry));
       clearErrorOverlay();
       hmrLog('Bootstrap render complete');
     } catch (err) {

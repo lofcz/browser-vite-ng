@@ -44,18 +44,10 @@ export function sendHotPayload(
 }
 
 /**
- * Iframe document: React UMD + Chobitsu + inlined browser HMR client bootstrap.
- * The bootstrap must wire `handleMessage` to the same HotPayload switch as
- * `packages/vite/src/client/browser.ts` (update → queueUpdate / css href swap,
- * full-reload, prune, error overlay).
+ * Error-overlay styles + the minimal base styles the preview relies on.
+ * Injected into the project's real index.html <head>.
  */
-export function createViteHmrIframeHtml(clientBootstrap: string): string {
-  return `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <script crossorigin src="https://unpkg.com/chobitsu"></script>
-  <style>
+const INJECTED_STYLES = `
     body { margin: 0; }
     #root { min-height: 100vh; }
     .hmr-error {
@@ -72,13 +64,48 @@ export function createViteHmrIframeHtml(clientBootstrap: string): string {
     }
     .hmr-error h2 { margin-top: 0; color: #ff8787; }
     .hmr-error pre { white-space: pre-wrap; word-wrap: break-word; }
-  </style>
-</head>
-<body>
-  <div id="root"></div>
-  <script type="module">
-${clientBootstrap}
-  </script>
-</body>
-</html>`
+  `;
+
+/**
+ * Build the iframe document from the project's REAL index.html. Its <title>,
+ * <meta>, and <body> content (including the app's own markup) are preserved;
+ * we inject the HMR runtime module + overlay styles the way Vite injects
+ * /@vite/client into your HTML at dev time. A #root mount point is added when
+ * the document doesn't declare one.
+ */
+export function createViteHmrIframeHtml(indexHtml: string, clientBootstrap: string): string {
+  const doc = new DOMParser().parseFromString(indexHtml, 'text/html');
+
+  // Head: keep the project's own title/meta/links; append Chobitsu (CDP) and
+  // the runtime styles.
+  const chobitsu = doc.createElement('script');
+  chobitsu.setAttribute('crossorigin', '');
+  chobitsu.src = 'https://unpkg.com/chobitsu';
+  doc.head.appendChild(chobitsu);
+
+  const style = doc.createElement('style');
+  style.textContent = INJECTED_STYLES;
+  doc.head.appendChild(style);
+
+  // Body: preserve the project's markup; guarantee a #root mount point.
+  if (!doc.getElementById('root')) {
+    const root = doc.createElement('div');
+    root.id = 'root';
+    doc.body.appendChild(root);
+  }
+
+  // The entry <script type="module" src="..."> is NOT executed from the
+  // document — blob-URL documents can't resolve /src/... natively. The runtime
+  // imports the entry itself after HMR bootstrap. Strip it to avoid a dead
+  // fetch, then append the inline HMR runtime module.
+  for (const s of Array.from(doc.querySelectorAll('script[type="module"][src]'))) {
+    s.remove();
+  }
+  const runtime = doc.createElement('script');
+  runtime.type = 'module';
+  runtime.textContent = clientBootstrap;
+  runtime.setAttribute('data-vite-hmr-runtime', '');
+  doc.body.appendChild(runtime);
+
+  return '<!DOCTYPE html>\n' + doc.documentElement.outerHTML;
 }
