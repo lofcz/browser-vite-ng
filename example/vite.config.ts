@@ -12,6 +12,34 @@ import { iframeRuntimePlugin } from './vite-plugin-iframe-runtime';
  * Internal `_`-prefixed modules are excluded (not user-importable); both the
  * canonical name and every public subpath export (fs/promises, etc.) are kept.
  */
+const EXAMPLE_NODE_MODULES = path.resolve(__dirname, 'node_modules');
+const FORK_SRC = path.resolve(__dirname, '../packages/vite/src');
+
+/**
+ * The browser-vite fork is aliased to its TypeScript source under
+ * ../packages/vite/src, which lives OUTSIDE this package. Bare imports made by
+ * that source (es-module-lexer, magic-string, picomatch, …) are therefore
+ * resolved by the bundler against the repo-root node_modules rather than this
+ * example's. This plugin re-points any bare import originating from the fork
+ * source at the example's own node_modules, so those deps only need to exist
+ * here.
+ */
+function forkDepsPlugin(): Plugin {
+  return {
+    name: 'fork-deps',
+    enforce: 'pre',
+    async resolveId(id, importer) {
+      if (!importer || !importer.startsWith(FORK_SRC)) return null;
+      if (id.startsWith('.') || id.startsWith('/') || id.startsWith('\0')) return null;
+      if (id.startsWith('node:')) return null;
+      const resolved = await this.resolve(id, EXAMPLE_NODE_MODULES + '/x.js', {
+        skipSelf: true,
+      });
+      return resolved;
+    },
+  };
+}
+
 function nodeBuiltinsPlugin(): Plugin {
   const ID = 'virtual:node-builtins';
   const list = [
@@ -35,7 +63,13 @@ function nodeBuiltinsPlugin(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [react(), tailwindcss(), iframeRuntimePlugin(), nodeBuiltinsPlugin()],
+  plugins: [
+    forkDepsPlugin(),
+    react(),
+    tailwindcss(),
+    iframeRuntimePlugin(),
+    nodeBuiltinsPlugin(),
+  ],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
