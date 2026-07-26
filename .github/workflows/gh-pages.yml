@@ -25,21 +25,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: oven-sh/setup-bun@v2
         with:
-          node-version: '24'
-      # --force: @oxc-transform/binding-wasm32-wasi declares cpu:["wasm32"],
-      # which makes npm abort with EBADPLATFORM on the x64 runner. The binding
-      # is only consumed through a vendored browser alias (never via its native
-      # loader), so overriding the platform check is safe.
+          bun-version: canary
+      # bun ignores the cpu:["wasm32"] platform constraint that breaks npm, and
+      # the repo is bun-only (bun.lock is the single source of truth).
       - name: Install dependencies
         working-directory: example
-        run: npm ci --force
+        run: bun install --frozen-lockfile
       - name: Build
         working-directory: example
         env:
           GITHUB_PAGES: true
-        run: npm run build
+        run: bun run build
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v5
         with:
