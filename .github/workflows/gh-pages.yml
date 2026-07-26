@@ -3,9 +3,12 @@ name: Deploy Example to GitHub Pages
 on:
   push:
     branches:
-      - main
+      - browser-vite
     paths:
       - 'example/**'
+      - 'packages/vite/src/browser/**'
+      - 'packages/vite/src/client/**'
+      - '.github/workflows/gh-pages.yml'
   workflow_dispatch:
 
 permissions:

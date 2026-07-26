@@ -57,8 +57,9 @@ export default defineConfig({
       ),
     },
   },
-  // Base path for GitHub Pages - uses repo name from environment or defaults to /
-  base: process.env.GITHUB_PAGES ? '/browser-vite-6/' : '/',
+  // Base path for GitHub Pages deploy (repo: lofcz/browser-vite-ng).
+  // Locally (dev/preview) we serve from '/'.
+  base: process.env.GITHUB_PAGES ? '/browser-vite-ng/' : '/',
   server: {
     port: 5173,
     // Required headers for SharedArrayBuffer (used by OXC WASM workers)

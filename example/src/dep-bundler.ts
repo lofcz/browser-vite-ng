@@ -24,8 +24,11 @@ export function initEsbuild(): Promise<void> {
   if (!initPromise) {
     // cjs-module-lexer + es-module-lexer are WASM-based and must be initialized
     // before parse() can run.
+    // public/esbuild.wasm is copied to the build root; resolve it relative to
+    // the configured base so the deploy works under a subpath (GitHub Pages).
+    const wasmURL = `${import.meta.env.BASE_URL}esbuild.wasm`;
     initPromise = Promise.all([
-      esbuild.initialize({ wasmURL: '/esbuild.wasm', worker: true }),
+      esbuild.initialize({ wasmURL, worker: true }),
       initCjsLexer(),
       initEsmLexer,
     ]).then(() => undefined);
