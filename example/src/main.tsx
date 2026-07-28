@@ -27,7 +27,7 @@ if (import.meta.env.DEV) {
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { init, Workspace } from 'modern-monaco';
-import { editorStore, useEditorStore, type VirtualFile } from './store';
+import { editorStore, useEditorStore, isDependencyPath, type VirtualFile } from './store';
 import { VFSFileSystem } from './monaco-fs';
 import { bindBrowserVite, bindMonacoHooks } from './fs-ops';
 import { App } from './App';
@@ -48,16 +48,16 @@ import tsconfigSchema from './vendor/tsconfig.schema.json';
 
 type MonacoNS = Awaited<ReturnType<typeof init>>;
 import { BrowserVite } from './browser-vite-wrapper';
-import { createViteHmrIframeHtml, type HotPayload } from './hmr-bridge';
+import {
+  createViteHmrIframeHtml,
+  prepareError,
+  sendHotPayload,
+  type HotPayload,
+} from './hmr-bridge';
 import { readVirtualFile } from 'browser-vite';
 import { installDependencies } from './installer';
 import { bundleDeps, defaultEntrySpecifiers } from './dep-bundler';
 import { depCacheKey, loadDepCache, saveDepCache } from './dep-cache';
-import {
-  buildTypesImportMap,
-  buildTypesImportMapFromPackageJson,
-  warmTypesCache,
-} from './ts-import-map';
 // es-module-lexer@2.3.1 ESM source (incl. base64 WASM) served to the iframe so
 // it can tokenize import specifiers with exact indices instead of regex.
 import esModuleLexerSrc from './vendor/es-module-lexer.js?raw';
@@ -268,6 +268,18 @@ export function Button({ children, onClick, primary }: ButtonProps) {
 `,
   },
   {
+    path: '/src/NumberDemo.tsx',
+    type: 'tsx',
+    content: `import React, { useState } from 'react';
+import { NumberFlowInput } from '@daformat/react-number-flow-input';
+
+export function NumberDemo() {
+  const [value, setValue] = useState(1000);
+  return <NumberFlowInput value={value} onChange={setValue} />;
+}
+`,
+  },
+  {
     path: '/src/utils.ts',
     type: 'ts',
     content: `// Utility functions
@@ -356,7 +368,9 @@ function initFileSystem() {
 
 // Convenience accessors over the store (imperative HMR paths).
 const fs = () => editorStore.getState().fileSystem;
-const getFile = (path: string) => fs()[path];
+/** Project file, or a dependency source opened from /node_modules. */
+const getFile = (path: string) =>
+  fs()[path] ?? editorStore.getState().dependencyFiles[path];
 const currentFile = () => editorStore.getState().currentFile;
 
 // =============================================================================
@@ -368,7 +382,9 @@ const currentFile = () => editorStore.getState().currentFile;
 // renders their content after addPanel), so engine code paths that touch them
 // must first `await previewMounted.promise` / `devtoolsMounted.promise`.
 const previewFrame = () => shellRefs.previewFrame!;
-const installConsoleEl = () => shellRefs.installConsole!;
+// Nullable on purpose: a restored dock layout may not contain the Preview
+// panel, and install must still run (and log) without its console host.
+const installConsoleEl = () => shellRefs.installConsole;
 const autoRunCheckbox = () => shellRefs.autoRunCheckbox!;
 const devtoolsFrame = () => shellRefs.devtoolsFrame;
 
@@ -408,6 +424,7 @@ const installConsoleStyles: Record<string, string> = {
 /** Show the console overlay in the preview pane, optionally clearing it. */
 function showInstallConsole(clear = true) {
   const el = installConsoleEl();
+  if (!el) return;
   if (clear) el.innerHTML = '';
   installProgressLine = null;
   el.classList.remove('hidden');
@@ -415,7 +432,7 @@ function showInstallConsole(clear = true) {
 
 /** Hide the console overlay, revealing the preview iframe again. */
 function hideInstallConsole() {
-  installConsoleEl().classList.add('hidden');
+  installConsoleEl()?.classList.add('hidden');
 }
 
 /** Append a line to the install console (ANSI-style colored, autoscrolls). */
@@ -424,6 +441,7 @@ function installLog(message: string, kind: keyof typeof installConsoleStyles = '
   // Finalize any in-place progress line: overwrite it with the completed
   // message instead of appending a new line (progress → result on one line).
   const el = installConsoleEl();
+  if (!el) return;
   if (installProgressLine) {
     installProgressLine.className = installConsoleStyles[kind];
     installProgressLine.textContent = message;
@@ -456,6 +474,7 @@ function installProgress(message: string) {
     const text = pendingProgress;
     pendingProgress = null;
     const el = installConsoleEl();
+    if (!el) return;
     if (!installProgressLine) {
       installProgressLine = document.createElement('div');
       installProgressLine.className = installConsoleStyles.dim;
@@ -507,7 +526,9 @@ function getMonacoLanguage(path: string): string {
   const ext = path.split('.').pop()?.toLowerCase() ?? '';
   switch (ext) {
     case 'tsx': return 'tsx';
-    case 'ts': return 'typescript';
+    case 'ts':
+    case 'mts':
+    case 'cts': return 'typescript';
     case 'jsx': return 'jsx';
     case 'js':
     case 'mjs':
@@ -580,6 +601,14 @@ const EDITOR_OPTIONS = {
   padding: { top: 8, bottom: 8 },
   scrollBeyondLastLine: false,
   tabSize: 2,
+  // Paste: modern-monaco defaults editContext:false + pasteAs.enabled:false.
+  // Keep pasteAs off here too — CopyPasteController otherwise claims the paste
+  // event and hangs on navigator.clipboard.read() while clipboard-read is
+  // "prompt", so Ctrl+V / context-menu Paste insert nothing.
+  pasteAs: { enabled: false },
+  // Avoid "monospace assumptions have been violated" when web fonts / DPR
+  // shift measured glyph width away from the assumed monospace advance.
+  disableMonospaceOptimizations: true,
   // Render hover/suggest/parameter-hint popovers in a position:fixed layer
   // appended to <body> instead of inside the editor's overflow container, so
   // they aren't clipped by the `overflow-hidden` editor/flex ancestors.
@@ -604,9 +633,12 @@ function ensureEditor(path: string): IEditor | null {
   const file = getFile(path);
   if (!host || !file) return null;
   const model = getOrCreateModel(path, file.content);
-  const ed = monaco.editor.create(host, { ...EDITOR_OPTIONS });
+  const readOnly = isDependencyPath(path);
+  const ed = monaco.editor.create(host, { ...EDITOR_OPTIONS, readOnly });
   ed.setModel(model);
-  wireModelContentSync(model);
+  // Dependency sources are installed artifacts: never sync their edits back
+  // into the VFS, or a stray keystroke would rewrite an installed package.
+  if (!readOnly) wireModelContentSync(model);
   editorsByPath.set(path, ed);
   return ed;
 }
@@ -647,6 +679,64 @@ function openFile(path: string) {
   editorStore.getState().openTab(path);
   editorStore.getState().setSelectedItems([path]);
   log(`Opened file: ${path}`, 'info');
+}
+
+type SelectionOrPosition =
+  | { startLineNumber: number; startColumn: number; endLineNumber: number; endColumn: number }
+  | { lineNumber: number; column: number };
+
+/**
+ * Open a path in a tab and return its model, reading dependency sources
+ * straight from the VFS. Used by every "navigate the user here" path
+ * (go-to-definition, peek, editor history).
+ */
+async function revealPath(path: string, readonlyContent?: string): Promise<MonacoModel | null> {
+  if (!monaco) return null;
+  if (getFile(path)) {
+    openFile(path);
+    return getOrCreateModel(path, getFile(path)!.content);
+  }
+  if (!isDependencyPath(path)) {
+    log(`File not found: ${path}`, 'error');
+    return null;
+  }
+  let content = readonlyContent;
+  if (content === undefined) {
+    try {
+      content = await workspace!.fs.readTextFile(new URL(path, 'file:///').href);
+    } catch {
+      log(`Dependency source not found: ${path}`, 'warn');
+      return null;
+    }
+  }
+  editorStore.getState().openDependencyFile({
+    path,
+    content,
+    type: getFileType(path),
+  });
+  log(`Opened dependency: ${path}`, 'info');
+  return getOrCreateModel(path, content);
+}
+
+/**
+ * Move the cursor to a definition target once its editor exists. The dock
+ * mounts panel content asynchronously, so the editor for a just-opened tab
+ * usually isn't there yet on this tick.
+ */
+function revealSelection(path: string, sel: SelectionOrPosition, attempt = 0) {
+  const ed = editorsByPath.get(path) ?? ensureEditor(path);
+  if (!ed) {
+    if (attempt < 40) setTimeout(() => revealSelection(path, sel, attempt + 1), 25);
+    return;
+  }
+  if ('startLineNumber' in sel) {
+    ed.setSelection(sel);
+    ed.revealRangeInCenterIfOutsideViewport(sel);
+  } else {
+    ed.setPosition(sel);
+    ed.revealPositionInCenterIfOutsideViewport(sel);
+  }
+  ed.focus();
 }
 
 /**
@@ -710,12 +800,44 @@ useEditorStore.subscribe((state, prev) => {
  * (oxc → import-analysis → ModuleGraph) so the preview can import them as
  * native ESM. Returns the entry URL to hand to the iframe bootstrap.
  */
+/** Vite's `transformRequest` error for a module that isn't on disk. */
+function missingEntryError(entry: string): Error & { code: string } {
+  const err = new Error(
+    `Failed to load url ${entry} (resolved id: ${entry}). Does the file exist?`,
+  ) as Error & { code: string };
+  err.code = 'ERR_LOAD_URL';
+  // The stack would be the host's own call frames — inside the IDE's
+  // `main.tsx`, which reads like the project file the message is about. Nothing
+  // in it points at the user's code, so don't put it in front of them.
+  err.stack = '';
+  return err;
+}
+
+/**
+ * Surface a failed bootstrap as Vite's `error` HotPayload, which raises the
+ * iframe's overlay. A missing entry never reaches `transformRequest`, so the
+ * server never broadcasts for it — the host has to.
+ */
+function reportPreviewError(entryPath: string, err: unknown) {
+  // prepareError keeps any `loc`/`frame` the transform attached, so a failing
+  // entry shows its real position instead of just a message.
+  const payload = prepareError(err, entryPath);
+  sendHotPayload(previewFrame(), { type: 'error', err: payload });
+  log(`Preview failed: ${payload.message}`, 'error');
+}
+
 async function prepareModules(entry: string): Promise<string> {
   if (!browserVite) throw new Error('BrowserVite not initialized');
   await syncFilesToBrowserVite();
+  // Never synthesize missing entries as empty content: BrowserVite.transform
+  // would setFile(entry, '') and resurrect a deleted/moved path, then the
+  // iframe would import a no-op module and clear the error overlay — dark
+  // preview with no HMR error. Match Vite's ERR_LOAD_URL wording instead.
+  const file = getFile(entry);
+  if (!file) throw missingEntryError(entry);
   // Warm the graph so import-analysis has rewritten every import specifier to
   // a servable URL before the iframe starts importing.
-  await browserVite.transform(getFile(entry)?.content ?? '', entry);
+  await browserVite.transform(file.content, entry);
   return entry;
 }
 
@@ -752,21 +874,26 @@ ${iframeRuntimeJs}
 // Preview Update
 // =============================================================================
 
-/** Sync VFS → browserVite and ensure graph entries exist for all files. */
+/** Sync VFS → browserVite and ensure graph entries exist for all files.
+ *
+ *  Files are addressed by their MAP KEY, never by `file.path`: the key is the
+ *  store's identity for a file, so a record whose own `path` has drifted can't
+ *  resurrect a deleted module here (which would look like a spurious change to
+ *  browser-vite and trigger a page reload). */
 async function syncFilesToBrowserVite() {
   if (!browserVite) return;
-  for (const file of Object.values(fs())) {
-    browserVite.setFile(file.path, file.content);
+  for (const [path, file] of Object.entries(fs())) {
+    browserVite.setFile(path, file.content);
   }
   // Transform entry + deps so ModuleGraph edges / accept boundaries exist.
   // Tolerate per-file transform errors: BrowserServer already broadcasts an
   // `error` HotPayload for a failed transform, and a file currently in an
   // error state must not abort the whole sync (that would prevent recovery
   // when the file is later fixed).
-  for (const file of Object.values(fs())) {
+  for (const [path, file] of Object.entries(fs())) {
     if (file.type === 'css' || file.type === 'ts' || file.type === 'tsx') {
       try {
-        await browserVite.transform(file.content, file.path);
+        await browserVite.transform(file.content, path);
       } catch {
         // error payload already sent by the server; continue syncing others
       }
@@ -794,12 +921,18 @@ function getEntryFromIndexHtml(): string {
 async function bootstrapPreview() {
   if (!browserVite || !iframeReady) return;
   const entryPath = getEntryFromIndexHtml();
-  const entry = await prepareModules(entryPath);
-  previewFrame().contentWindow?.postMessage(
-    { type: 'hmr-update', entry, fileType: getFileType(entry) },
-    '*',
-  );
-  log(`Bootstrap entry sent to iframe (real ESM serving): ${entry}`, 'hmr');
+  try {
+    const entry = await prepareModules(entryPath);
+    previewFrame().contentWindow?.postMessage(
+      { type: 'hmr-update', entry, fileType: getFileType(entry) },
+      '*',
+    );
+    log(`Bootstrap entry sent to iframe (real ESM serving): ${entry}`, 'hmr');
+  } catch (err) {
+    // Report the failure instead of posting an `hmr-update`, which the iframe
+    // would treat as a clean render and use to clear the overlay.
+    reportPreviewError(entryPath, err);
+  }
 }
 
 /**
@@ -947,6 +1080,13 @@ window.addEventListener('message', async (event) => {
     await bootstrapPreview();
   } else if (event.data?.type === 'hmr-log') {
     log(`iframe: ${event.data.message}`, 'hmr');
+  } else if (event.data?.type === 'runtime-error') {
+    // Already source-mapped by the iframe runtime, so this names real project
+    // files at original positions.
+    const { kind, message, stack, file, line, column } = event.data;
+    const where = file ? ` at ${file}:${line}:${column}` : '';
+    log(`${kind}: ${message}${where}`, 'error');
+    if (stack) log(stack, 'error');
   } else if (event.data?.type === 'hmr-fetch-module') {
     // Iframe asked for a fresh transformed module (real dev-server fetchModule).
     try {
@@ -993,18 +1133,20 @@ window.addEventListener('message', async (event) => {
           '*',
         );
       } else {
+        // The map rides along with the code: the iframe re-bases it after
+        // rewriting specifiers to blob URLs, then inlines it so DevTools and
+        // stack traces resolve to real files.
         previewFrame().contentWindow?.postMessage(
-          { type: 'hmr-module', id: event.data.id, code: served.code },
+          { type: 'hmr-module', id: event.data.id, code: served.code, map: served.map },
           '*',
         );
       }
     } catch (err) {
+      // The message alone would strand the transform's file/line/frame on this
+      // side; forward the full payload so the overlay can point at real source.
+      const detail = prepareError(err, event.data.path as string);
       previewFrame().contentWindow?.postMessage(
-        {
-          type: 'hmr-module',
-          id: event.data.id,
-          error: err instanceof Error ? err.message : String(err),
-        },
+        { type: 'hmr-module', id: event.data.id, error: detail.message, errorDetail: detail },
         '*',
       );
     }
@@ -1014,6 +1156,17 @@ window.addEventListener('message', async (event) => {
     // Real Vite reload → dev server re-serves the CURRENT page. Here the host
     // rebuilds the iframe document from the latest VFS index.html and
     // re-bootstraps the entry it declares.
+    const entry = getEntryFromIndexHtml();
+    if (!getFile(entry)) {
+      // With the entry gone the rebuild can only end on the same "Failed to
+      // load url" overlay, so swapping the document would blank the preview and
+      // re-raise that overlay for every edit that reloads (the entry module is
+      // a dead end for HMR, so most of them do). Keep the document and restate
+      // the error — the overlay is already showing it, so nothing moves.
+      log(`Full reload skipped — entry ${entry} does not exist`, 'warn');
+      reportPreviewError(entry, missingEntryError(entry));
+      return;
+    }
     log('Full reload — rebuilding iframe from latest index.html', 'hmr');
     void initIframe();
   } else if (event.data?.type === 'cdp-ready') {
@@ -1038,10 +1191,38 @@ onPreviewOpen((open) => {
   if (open && browserVite) void initIframe();
 });
 
-async function initIframe() {
+let pendingIframeBuild: Promise<void> | null = null;
+
+/**
+ * Rebuild the preview document, coalescing requests that arrive while a build
+ * is already scheduled.
+ *
+ * One user action routinely produces several `full-reload` payloads — deleting
+ * a folder unlinks every file under it, and each unlink whose module has no HMR
+ * boundary is a page reload. Swapping the document once per payload would blank
+ * the preview and re-create the error overlay over and over (the "flashing"),
+ * while a single swap shows the same end state: the document is built from the
+ * latest VFS index.html, and the entry is read when the new iframe reports
+ * ready, so a coalesced request loses nothing.
+ */
+function initIframe(): Promise<void> {
+  pendingIframeBuild ??= Promise.resolve()
+    .then(buildPreviewDocument)
+    .finally(() => {
+      pendingIframeBuild = null;
+    });
+  return pendingIframeBuild;
+}
+
+async function buildPreviewDocument() {
   // The preview iframe mounts asynchronously (dockview renders panel content
-  // after addPanel). Wait for it before touching `.src`.
-  await previewMounted.promise;
+  // after addPanel). Wait for it before touching `.src` — but bounded, since a
+  // restored layout may have no Preview panel at all.
+  await Promise.race([previewMounted.promise, new Promise((r) => setTimeout(r, 2000))]);
+  if (!shellRefs.previewFrame) {
+    log('Preview panel is closed — skipping iframe bootstrap', 'warn');
+    return;
+  }
   log('Initializing iframe with HMR runtime...', 'hmr');
   iframeReady = false;
   const html = createHMRRuntime();
@@ -1074,8 +1255,11 @@ async function runInstall(): Promise<boolean> {
   if (!browserVite || installing) return depsInstalled;
   installing = true;
   setStatusBar({ deps: 'installing…' });
-  // Wait for the preview panel's install-console host (async dockview mount).
-  await previewMounted.promise;
+  // Give the preview panel's install-console host a chance to mount (dockview
+  // renders panel content after addPanel), but never wait on it: a restored
+  // layout without a Preview panel would otherwise block install — and with it
+  // the rest of initialization — forever.
+  await Promise.race([previewMounted.promise, new Promise((r) => setTimeout(r, 2000))]);
   showInstallConsole(true);
   installLog('$ browser-vite install', 'dim');
   try {
@@ -1121,10 +1305,10 @@ async function runInstall(): Promise<boolean> {
     // Brief pause so the success line is visible before the preview takes over.
     await new Promise((r) => setTimeout(r, 400));
     hideInstallConsole();
-    // Type-map sync + diagnostic refresh can pull large CDN `.d.ts` (and with
-    // real DOM libs loaded, rebuild the TS program). Never block Install/Ready
-    // on that — IntelliSense catches up in the background.
-    void syncTypesImportMap(installed);
+    // Announcing the install to the TS worker rebuilds its program against the
+    // freshly unpacked declarations. Never block Install/Ready on it —
+    // IntelliSense catches up in the background.
+    void announceInstalledPackages(installed);
     return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -1141,50 +1325,52 @@ async function runInstall(): Promise<boolean> {
   }
 }
 
-/** Last import-map JSON pushed to the worker — skip no-op updates. */
-let lastTypesImportMapJson = '';
+type TsWorkerHandle = {
+  getProxy: () => Promise<{
+    fsNotify?: (kind: 'create' | 'remove' | 'modify', path: string, type?: number) => Promise<void>;
+  }>;
+};
+
+/** Resolve the TypeScript LSP worker (not HTML/CSS/JSON — those also register
+ *  language features and used to claim `__monacoLanguageWorker`). */
+function getTsLanguageWorker(): TsWorkerHandle | undefined {
+  const g = globalThis as {
+    __monacoTsWorker?: TsWorkerHandle;
+    __monacoLanguageWorker?: TsWorkerHandle;
+  };
+  return g.__monacoTsWorker ?? g.__monacoLanguageWorker;
+}
 
 /**
- * Push an esm.sh types import map into the TS worker — host-owned, never
- * written into the user's project files (IDEs don't require manual import maps).
- * Safe to call without awaiting; must not gate Install/Ready.
+ * Tell the TypeScript worker that packages appeared under `/node_modules`.
+ *
+ * The installer writes thousands of files inside `withVirtualFileBatch`, which
+ * suppresses per-file VFS events on purpose (node_modules are not app modules,
+ * and one HMR event per file made installs crawl). The worker therefore never
+ * hears about them through the normal watcher, and any negative type-resolution
+ * result it cached before the install — "this package has no types" — would
+ * stick forever. One notification per package clears those and re-indexes.
+ *
+ * If no TS worker exists yet there is nothing stale to invalidate: the worker
+ * reads declarations straight from the VFS when it starts, so a later boot
+ * picks the new packages up on its own.
  */
-async function syncTypesImportMap(installed: Array<{ name: string; version: string }>) {
-  const importMap = buildTypesImportMap(installed);
-  const json = JSON.stringify(importMap.imports);
-  const names = Object.keys(importMap.imports).filter((k) => !k.endsWith('/'));
-  // Always warm the monaco HTTP cache for the pinned URLs (idempotent). This is
-  // what makes the worker's first resolve a cache hit instead of a cold CDN
-  // waterfall — do it even when the import map JSON is unchanged.
-  const warm = warmTypesCache(importMap).then((r) => {
-    log(`[types] warmed ${r.warmed} decl(s)${r.failed ? `, ${r.failed} failed` : ''}`, 'dim');
-  });
-  if (json === lastTypesImportMapJson) {
-    await warm;
-    return;
-  }
+async function announceInstalledPackages(installed: Array<{ name: string }>) {
+  const worker = getTsLanguageWorker();
+  if (!worker) return;
   try {
-    const worker = (globalThis as { __monacoLanguageWorker?: { getProxy: () => Promise<{
-      updateCompilerOptions: (o: { importMap: typeof importMap }) => Promise<void>;
-    }> } }).__monacoLanguageWorker;
-    if (!worker) {
-      await warm;
-      return;
+    const proxy = await worker.getProxy();
+    if (typeof proxy.fsNotify !== 'function') return;
+    for (const { name } of installed) {
+      await proxy.fsNotify('create', `/node_modules/${name}/package.json`, 1);
     }
-    // Overlap cache warm with the worker import-map update.
-    const proxyP = worker.getProxy().then((proxy) => proxy.updateCompilerOptions({ importMap }));
-    await Promise.all([proxyP, warm]);
-    lastTypesImportMapJson = json;
-    // Only nudge the visible buffer — refreshing every open model forces a
-    // program-wide re-resolve on the install critical path.
-    const active = useEditorStore.getState().activeTab;
-    if (active && active !== 'preview') {
-      const model = monaco?.editor.getModels().find((m) => m.uri.path === active);
+    // Re-validate every open buffer: any of them may import a new package.
+    for (const model of monaco?.editor.getModels() ?? []) {
       Reflect.get(model, 'refreshDiagnostics')?.();
     }
-    log(`[types] esm.sh decls synced → ${names.join(', ')}`, 'success');
+    log(`[types] ${installed.length} package(s) announced to the TS worker`, 'success');
   } catch (err) {
-    log(`[types] failed to sync import map: ${err instanceof Error ? err.message : err}`, 'warn');
+    log(`[types] failed to announce install: ${err instanceof Error ? err.message : err}`, 'warn');
   }
 }
 
@@ -1213,15 +1399,16 @@ async function initialize() {
       customFS: new VFSFileSystem(),
     });
 
-    // SINGLE-OWNER GUARD. `_openTextDocument` is called by the TS worker's
-    // `openModel` host to materialize *dependency* models (e.g. opening
-    // main.tsx resolves ./App.tsx, ./Counter.tsx, …). modern-monaco's stock
-    // implementation ends with `editor.setModel(model)` — which rips the
-    // visible editor away from the file you clicked to the last-resolved
-    // dependency (the "wild blinking / wrong file" bug). We own the editor, so
-    // we replace it: still create + register the model (the worker needs the
-    // document for intellisense), but NEVER attach it to the editor. The only
-    // code path that changes the visible model is our `openFile`.
+    // SINGLE-OWNER GUARD. `_openTextDocument` is monaco's "reveal this resource
+    // to the user" path (go-to-definition, peek, history). modern-monaco's stock
+    // implementation ends with `editor.setModel(model)`, which would swap the
+    // model under whichever editor happened to have focus instead of opening a
+    // tab — we own the dock, so we route the navigation through the store and
+    // then apply the requested selection to the editor that lands there.
+    //
+    // Background model creation for the language service does NOT come through
+    // here: the TS worker's `openModel` host calls `_openBackgroundDocument`,
+    // which never touches an editor.
     (workspace as unknown as {
       _openTextDocument: (
         m: MonacoNS,
@@ -1230,29 +1417,14 @@ async function initialize() {
         sel?: unknown,
         readonlyContent?: string,
       ) => Promise<unknown>;
-    })._openTextDocument = async (m, _ed, uri, _sel, readonlyContent) => {
-      const fs = workspace!.fs;
+    })._openTextDocument = async (_m, _ed, uri, sel, readonlyContent) => {
       const url = new URL(String(uri), 'file:///');
-      const href = url.href;
-      const content = readonlyContent ?? (await fs.readTextFile(href));
-      const modelUri = m.Uri.parse(href);
-      let model = m.editor.getModel(modelUri);
-      if (!model) model = m.editor.createModel(content, getMonacoLanguage(url.pathname), modelUri);
-      return model; // attach-free: background dependency resolution never grabs an editor
+      const path = decodeURIComponent(url.pathname);
+      const model = await revealPath(path, readonlyContent);
+      if (!model) throw new Error(`Cannot open ${path}`);
+      if (sel) revealSelection(path, sel as SelectionOrPosition);
+      return model;
     };
-
-    // Seed the types import map once; remember it so post-install sync is a
-    // no-op when resolved versions match the package.json pins (common case).
-    // Prefer `@types/*` `.d.ts` URLs (not JS modules) so the worker skips the
-    // x-typescript-types hop. Warm monaco's HTTP cache in parallel with init
-    // so the first diagnostic pass is usually a cache hit.
-    const seedTypesImportMap = buildTypesImportMapFromPackageJson(
-      getFile('/package.json')?.content ?? '{}',
-    );
-    lastTypesImportMapJson = JSON.stringify(seedTypesImportMap.imports);
-    const seedWarm = warmTypesCache(seedTypesImportMap).then((r) => {
-      log(`[types] seed cache: ${r.warmed} decl(s)`, 'dim');
-    });
 
     monaco = await init({
       defaultTheme: 'dark-plus', // VS Code Dark+ — closest to VS Dark
@@ -1264,11 +1436,12 @@ async function initialize() {
       workspace,
       lsp: {
         typescript: {
-          // Host-owned esm.sh types (not written into user project files).
-          // Seeded from package.json ranges; Install replaces with exact pins
-          // via worker.updateCompilerOptions({ importMap }) only when they differ.
-          resolution: 'importmap',
-          importMap: seedTypesImportMap,
+          // Types come from the project's real `/node_modules` in the VFS — the
+          // same files tsc would read — so IntelliSense tracks whatever the
+          // installer actually put on disk. No CDN, no import map to keep in
+          // sync, and a package's own `.d.ts` always wins over a guess.
+          resolution: 'node_modules',
+          importMap: { imports: {}, scopes: {} },
           compilerOptions: {
             jsx: 4 /* JsxEmit.ReactJSX */,
             allowJs: true,
@@ -1304,8 +1477,8 @@ async function initialize() {
     browserVite.setPreviewIframe(previewFrame());
 
     // Seed VFS into browser-vite
-    for (const file of Object.values(fs())) {
-      browserVite.setFile(file.path, file.content);
+    for (const [path, file] of Object.entries(fs())) {
+      browserVite.setFile(path, file.content);
     }
 
     // Mount the React Explorer into #fileTree and bind structural-ops hooks so
@@ -1343,10 +1516,6 @@ async function initialize() {
     });
     autoRunCheckbox().disabled = false;
     setShellReady(true);
-
-    // Let seed type fetches finish (or nearly) before attaching editors so the
-    // first IntelliSense pass doesn't wait on a cold CDN resolve.
-    await Promise.race([seedWarm, new Promise((r) => setTimeout(r, 1500))]);
 
     // Hydrate whatever tab is already active (dock restore → store), or open
     // the project entry when nothing was restored.

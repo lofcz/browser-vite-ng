@@ -83,16 +83,15 @@ export function iframeRuntimePlugin(): Plugin {
       ].join('\n');
     },
     // Rebuild the virtual module when the iframe sources change in dev.
+    // Watching the whole directory (rather than a hand-listed set of entries)
+    // means a newly added module is picked up without touching this plugin.
     configureServer(server) {
-      const watch = [
-        'src/iframe/runtime.ts',
-        'src/iframe/client.ts',
-        'src/iframe/react-refresh.ts',
-        'src/vendor/react-refresh-runtime.js',
-      ].map((f) => path.resolve(__dirname, f));
-      server.watcher.add(watch);
+      const iframeDir = path.resolve(__dirname, 'src/iframe');
+      const extraWatch = [path.resolve(__dirname, 'src/vendor/react-refresh-runtime.js')];
+      server.watcher.add([iframeDir, ...extraWatch]);
       server.watcher.on('change', (file) => {
-        if (watch.includes(file)) {
+        const normalized = path.resolve(file);
+        if (normalized.startsWith(iframeDir) || extraWatch.includes(normalized)) {
           const mod = server.moduleGraph.getModuleById(RESOLVED_ID);
           if (mod) server.moduleGraph.invalidateModule(mod);
         }

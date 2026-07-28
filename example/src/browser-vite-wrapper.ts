@@ -17,13 +17,14 @@ import {
   type HotChannel,
   type HotPayload,
   type ModuleNode,
+  type RawSourceMap,
   updateModules,
 } from 'browser-vite';
 import { sendHotPayload } from './hmr-bridge';
 
 export interface TransformResult {
   code: string;
-  map: any | null;
+  map: RawSourceMap | null;
 }
 
 export interface VirtualFile {
@@ -92,8 +93,12 @@ export class BrowserVite {
     return { code: res.code, map: res.map };
   }
 
-  /** Serve transformed module to the preview iframe / importUpdatedModule. */
-  async fetchModule(url: string): Promise<{ code: string } | null> {
+  /**
+   * Serve transformed module to the preview iframe / importUpdatedModule.
+   * The sourcemap travels with the code — the iframe re-bases it after
+   * rewriting import specifiers to blob URLs, then inlines it.
+   */
+  async fetchModule(url: string): Promise<TransformResult | null> {
     if (!this.server) return null;
     return this.server.fetchModule(url);
   }

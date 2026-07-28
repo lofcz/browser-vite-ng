@@ -16,7 +16,17 @@ import { PluginContainer } from './pluginContainer'
 import { ModuleGraph, ModuleNode } from './moduleGraph'
 import { importAnalysisTransform, isExplicitImportRequired } from './plugins/importAnalysis'
 import { cssAnalysisPlugin } from '../node/plugins/css'
-import { transformWithOxc, transformCssDev } from './transform'
+import {
+  transformWithOxc,
+  transformCssDev,
+  BrowserTransformError,
+} from './transform'
+import {
+  combineSourcemaps,
+  applySourcemapIgnoreList,
+  ensureSourcesContent,
+  type RawSourceMap,
+} from './sourcemap'
 import { addRefreshWrapper } from './plugins/refresh'
 import {
   readVirtualFile,
@@ -45,8 +55,28 @@ export interface BrowserServerOptions {
 
 const CLIENT_PUBLIC_PATH = '/@vite/client'
 
+/** Same code Vite's Node `transformRequest` attaches when load returns null. */
+export const ERR_LOAD_URL = 'ERR_LOAD_URL'
+
 function isJSRequest(url: string): boolean {
   return /\.[cm]?[jt]sx?(?:$|\?)/.test(url.split('#')[0])
+}
+
+/**
+ * Mirror Vite's `Failed to load url … Does the file exist?` so a missing VFS
+ * module becomes an `error` HotPayload (overlay) instead of a silent empty
+ * transform / dark preview.
+ */
+function throwLoadUrlError(url: string, id: string, mod: ModuleNode): never {
+  const importer = mod.importers.values().next().value as ModuleNode | undefined
+  const importerPath = importer?.file || importer?.url
+  const err = new Error(
+    `Failed to load url ${url} (resolved id: ${id})${
+      importerPath ? ` in ${importerPath}` : ''
+    }. Does the file exist?`,
+  ) as Error & { code: string }
+  err.code = ERR_LOAD_URL
+  throw err
 }
 function isCSSRequest(url: string): boolean {
   return /\.css(?:$|\?)/.test(url.split('#')[0])
@@ -125,9 +155,14 @@ export class BrowserServer {
    * Full dev transform of one module URL — analogue of `transformRequest`.
    * Returns the transformed ESM code served to the browser/iframe.
    */
-  private inFlight = new Map<string, Promise<{ code: string; map: object | null } | null>>()
+  private inFlight = new Map<
+    string,
+    Promise<{ code: string; map: RawSourceMap | null } | null>
+  >()
 
-  async transformRequest(url: string): Promise<{ code: string; map: object | null; etag?: string } | null> {
+  async transformRequest(
+    url: string,
+  ): Promise<{ code: string; map: RawSourceMap | null; etag?: string } | null> {
     const prettyUrl = url.replace(/^\/@id\//, '')
     const mod = await this.moduleGraph.ensureEntryFromUrl(url, true)
     if (mod.transformResult) return mod.transformResult
@@ -145,13 +180,18 @@ export class BrowserServer {
       // HotPayload so the client renders its error overlay, instead of only
       // surfacing as an uncaught rejection in the host console.
       const e = err instanceof Error ? err : new Error(String(err))
+      const rich = err instanceof BrowserTransformError ? err : null
       this.hotChannel.send?.({
         type: 'error',
         err: {
           message: e.message,
           stack: e.stack,
-          id: url,
-          plugin: 'vite:oxc',
+          id: rich?.id ?? url,
+          // `loc` + `frame` are what turn "unexpected token" into
+          // "src/App.tsx:12:7" plus the offending line in the overlay.
+          loc: rich?.loc,
+          frame: rich?.frame,
+          plugin: rich?.plugin ?? 'vite:oxc',
         },
       } as never)
       throw err
@@ -164,7 +204,7 @@ export class BrowserServer {
     _url: string,
     prettyUrl: string,
     mod: ModuleNode,
-  ): Promise<{ code: string; map: object | null } | null> {
+  ): Promise<{ code: string; map: RawSourceMap | null } | null> {
 
     const resolved = await this.resolveId(prettyUrl)
     const id = resolved?.id ?? prettyUrl
@@ -174,7 +214,8 @@ export class BrowserServer {
 
     let code: string
     if (isCSSRequest(id)) {
-      const raw = (await this.load(id)) ?? ''
+      const raw = await this.load(id)
+      if (raw == null) throwLoadUrlError(prettyUrl, id, mod)
       const result = transformCssDev(raw, id, this.clientPublicPath)
       code = result.code
       const analyzed = await importAnalysisTransform(code, id, {
@@ -205,7 +246,7 @@ export class BrowserServer {
     }
 
     const loaded = await this.load(id)
-    if (loaded == null) return null
+    if (loaded == null) throwLoadUrlError(prettyUrl, id, mod)
 
     // Oxc transform (JS/TS/JSX/TSX → JS) first — identical to Vite's transform
     // order, so import-analysis runs on JavaScript with correct lexer indices.
@@ -246,7 +287,32 @@ export class BrowserServer {
     })
     code = analyzed?.code ?? code
 
-    const out = { code, map: analyzed?.map ?? viaPlugins.map ?? oxc.map ?? null }
+    // Each stage produces a map against the PREVIOUS stage's output, so the
+    // last one alone is nearly an identity map. Chain them newest-first to get
+    // a single map from the served code back to the original TSX — this is the
+    // whole reason stack frames can name real files.
+    //
+    // `addRefreshWrapper` only appends, so it shifts no existing position and
+    // needs no map of its own.
+    const map = ensureSourcesContent(
+      combineSourcemaps(
+        cleanUrl(id),
+        [
+          analyzed?.map,
+          viaPlugins.map as RawSourceMap | null | undefined,
+          oxc.map,
+        ].filter((m): m is RawSourceMap => !!m),
+      ),
+      cleanUrl(id),
+      loaded,
+    )
+    const out = {
+      code,
+      // An empty chain (no stage produced mappings) is reported as "no map"
+      // rather than a map with zero mappings, which consumers would have to
+      // special-case anyway.
+      map: map?.mappings ? applySourcemapIgnoreList(map) : null,
+    }
     mod.transformResult = out
     return out
   }
@@ -299,10 +365,18 @@ export class BrowserServer {
     }
   }
 
-  /** Serve a module to `importUpdatedModule` / initial load. */
-  async fetchModule(url: string): Promise<{ code: string } | null> {
+  /**
+   * Serve a module to `importUpdatedModule` / initial load.
+   *
+   * The map travels WITH the code (rather than being inlined here) because the
+   * consumer still has to rewrite import specifiers to blob URLs before
+   * executing, and that rewrite has to be reflected in the map.
+   */
+  async fetchModule(
+    url: string,
+  ): Promise<{ code: string; map: RawSourceMap | null } | null> {
     const res = await this.transformRequest(url)
-    return res ? { code: res.code } : null
+    return res ? { code: res.code, map: res.map } : null
   }
 
   /** Trigger full HMR for an edited file (content already written to VFS). */

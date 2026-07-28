@@ -20,7 +20,7 @@ import {
   type IDockviewPanelProps,
 } from 'dockview-react';
 
-import { useEditorStore } from './store';
+import { useEditorStore, isDependencyPath } from './store';
 import { FileIcon } from './file-icons';
 import {
   buildLayout,
@@ -88,6 +88,10 @@ export function EditorDock({
   // Which dock instance the store subscription is bound to (StrictMode fires
   // onReady on a thrown-away instance first; we bind to the LIVE one).
   const storeSubApi = useRef<DockviewApi | null>(null);
+  // Unsubscribe for that binding. The discarded StrictMode dock must not keep
+  // listening: a later close would reach its disposed grid and throw
+  // "resource already disposed".
+  const storeUnsub = useRef<(() => void) | null>(null);
 
   const handleReady = (event: DockviewReadyEvent) => {
     const api = event.api;
@@ -129,6 +133,15 @@ export function EditorDock({
       if (persistedDock) {
         try {
           api.fromJSON(JSON.parse(persistedDock));
+          // Dependency sources are read out of an installed package, and
+          // /node_modules is only repopulated well after the grid is built —
+          // so drop those tabs here rather than restoring a panel whose file
+          // can't exist yet.
+          for (const panel of api.panels) {
+            if (isFilePanel(panel.id) && isDependencyPath(pathFromPanelId(panel.id))) {
+              panel.api.close();
+            }
+          }
           // Dock tabs are restored into the UI, but the zustand store starts
           // empty on every reload. Mirror file panels → openFiles/activeTab so
           // the engine can lazily hydrate Monaco into the *visible* host.
@@ -169,6 +182,8 @@ export function EditorDock({
     // "invalid location". Waiting one macrotask lets dockview finish its layout
     // pass, so every addPanel lands on a stable grid. Bound once per live dock.
     if (storeSubApi.current === api) return;
+    storeUnsub.current?.();
+    storeUnsub.current = null;
     storeSubApi.current = api;
     // Defer to a macrotask: the grid is built but not yet laid out at the end
     // of onReady, and the engine's openFile fires on the same tick — a grid
@@ -193,7 +208,8 @@ export function EditorDock({
       };
       // Reconcile files the engine opened before this subscription existed.
       syncFromStore();
-      useEditorStore.subscribe((state, prev) => {
+      if (storeSubApi.current !== api) return;
+      storeUnsub.current = useEditorStore.subscribe((state, prev) => {
         syncing = true;
         try {
           let opened: string | null = null;

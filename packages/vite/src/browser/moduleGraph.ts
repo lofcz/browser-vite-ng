@@ -5,9 +5,11 @@
  * Soft/hard invalidation, acceptedHmrDeps/Exports, importedBindings preserved.
  */
 
+import type { RawSourceMap } from './sourcemap'
+
 export interface TransformResult {
   code: string
-  map: object | null
+  map: RawSourceMap | null
   etag?: string
 }
 

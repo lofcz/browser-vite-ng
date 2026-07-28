@@ -345,78 +345,6 @@ function nodeFsShimPlugin(): Plugin {
 }
 
 /**
- * Same-origin proxy for esm.sh so modern-monaco's TS worker can fetch `.d.ts`
- * under COEP: require-corp. Direct https://esm.sh responses omit CORP and are
- * blocked in the cross-origin-isolated editor page; we re-serve them with the
- * isolation headers and rewrite `x-typescript-types` to stay on this origin.
- */
-function esmShTypesProxyPlugin(): Plugin {
-  return {
-    name: 'esm-sh-types-proxy',
-    configureServer(server) {
-      server.middlewares.use(async (req, res, next) => {
-        const raw = (req.url ?? '').split('?')[0];
-        if (!raw.startsWith('/esm-sh/')) return next();
-        const targetPath = raw.slice('/esm-sh/'.length);
-        if (!targetPath || targetPath.includes('..')) {
-          res.statusCode = 400;
-          res.end('bad path');
-          return;
-        }
-        const qs = (req.url ?? '').includes('?') ? '?' + (req.url ?? '').split('?')[1] : '';
-        const target = `https://esm.sh/${targetPath}${qs}`;
-        try {
-          const upstream = await fetch(target, {
-            headers: { accept: req.headers.accept ?? '*/*' },
-            redirect: 'follow',
-          });
-          const buf = Buffer.from(await upstream.arrayBuffer());
-          res.setHeader(
-            'content-type',
-            upstream.headers.get('content-type') ?? 'application/javascript; charset=utf-8',
-          );
-          res.setHeader('cross-origin-resource-policy', 'cross-origin');
-          res.setHeader('cross-origin-embedder-policy', 'require-corp');
-          // Long TTL so modern-monaco's IndexedDB cache (and the browser) keep
-          // `.d.ts` hits warm across reloads — IntelliSense cold-start is
-          // dominated by re-fetching these when max-age is too short.
-          const isDts = /\.d\.(c|m)?ts$/i.test(targetPath);
-          res.setHeader(
-            'cache-control',
-            isDts ? 'public, max-age=604800, immutable' : 'public, max-age=86400',
-          )
-          const dts = upstream.headers.get('x-typescript-types');
-          if (dts) {
-            // Absolute same-origin URL so the worker's `new URL(dts, res.url)`
-            // never depends on Response.url being populated.
-            try {
-              const u = new URL(dts, 'https://esm.sh/');
-              const host = req.headers.host ?? 'localhost';
-              const proto = (req.headers['x-forwarded-proto'] as string) || 'http';
-              if (u.hostname === 'esm.sh') {
-                res.setHeader(
-                  'x-typescript-types',
-                  `${proto}://${host}/esm-sh${u.pathname}${u.search}`,
-                );
-              } else {
-                res.setHeader('x-typescript-types', dts);
-              }
-            } catch {
-              res.setHeader('x-typescript-types', dts);
-            }
-          }
-          res.statusCode = upstream.status;
-          res.end(buf);
-        } catch (err) {
-          res.statusCode = 502;
-          res.end(`esm.sh proxy failed: ${err instanceof Error ? err.message : err}`);
-        }
-      });
-    },
-  };
-}
-
-/**
  * Serves the installed modern-monaco fork's editor-core and builtin LSP at
  * clean, stable URLs (`/monaco/*.mjs`). modern-monaco's `init()` lazy-loads
  * these from esm.sh unless the page importmap maps them to local URLs — the
@@ -571,7 +499,6 @@ export default defineConfig({
     iframeRuntimePlugin(),
     nodeBuiltinsPlugin(),
     monacoModulesPlugin(),
-    esmShTypesProxyPlugin(),
   ],
   resolve: {
     alias: {

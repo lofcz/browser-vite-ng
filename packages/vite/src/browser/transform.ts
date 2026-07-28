@@ -8,6 +8,8 @@
  * under --isolatedDeclarations).
  */
 
+import { ensureSourcesContent, type RawSourceMap } from './sourcemap'
+
 export interface BrowserTransformOptions {
   lang?: 'js' | 'jsx' | 'ts' | 'tsx' | 'dts'
   jsx?:
@@ -30,8 +32,23 @@ export interface BrowserTransformOptions {
 
 export interface BrowserTransformResult {
   code: string
-  map: object | null
+  map: RawSourceMap | null
   warnings?: string[]
+}
+
+/** Oxc's `ErrorLabel` — byte offsets into the ORIGINAL source. */
+interface OxcErrorLabel {
+  message?: string | null
+  start: number
+  end: number
+}
+
+interface OxcError {
+  severity?: string
+  message: string
+  labels?: OxcErrorLabel[]
+  helpMessage?: string | null
+  codeframe?: string | null
 }
 
 type OxcWasmTransformSync = (
@@ -41,7 +58,115 @@ type OxcWasmTransformSync = (
 ) => {
   code: string
   map?: object | null
-  errors?: Array<{ message: string }>
+  errors?: OxcError[]
+}
+
+/**
+ * A transform failure carrying everything the error overlay needs to point at
+ * real source: `loc` (file + 1-based line / 0-based column, like Rollup and
+ * Vite's own plugin errors) and a `frame` code excerpt.
+ */
+export interface TransformErrorLocation {
+  file: string
+  line: number
+  column: number
+}
+
+export class BrowserTransformError extends Error {
+  readonly id: string
+  readonly loc?: TransformErrorLocation
+  readonly frame?: string
+  readonly plugin = 'vite:oxc'
+
+  constructor(
+    message: string,
+    id: string,
+    loc?: TransformErrorLocation,
+    frame?: string,
+  ) {
+    super(message)
+    this.name = 'BrowserTransformError'
+    this.id = id
+    this.loc = loc
+    this.frame = frame
+  }
+}
+
+/** Byte/char offset → 1-based line, 0-based column. */
+function offsetToLineColumn(
+  code: string,
+  offset: number,
+): { line: number; column: number } {
+  const clamped = Math.max(0, Math.min(offset, code.length))
+  let line = 1
+  let lineStart = 0
+  for (let i = 0; i < clamped; i++) {
+    if (code.charCodeAt(i) === 10 /* \n */) {
+      line++
+      lineStart = i + 1
+    }
+  }
+  return { line, column: clamped - lineStart }
+}
+
+/**
+ * Rollup-style code frame (` 12 |  <div>` + a caret line). Oxc ships its own
+ * `codeframe`, but it is ANSI-coloured and references the file by the name we
+ * passed, so we render our own for the overlay.
+ */
+export function generateCodeFrame(
+  source: string,
+  line: number,
+  column: number,
+  context = 2,
+): string {
+  const lines = source.split('\n')
+  const start = Math.max(1, line - context)
+  const end = Math.min(lines.length, line + context)
+  const gutter = String(end).length
+  const out: string[] = []
+  for (let n = start; n <= end; n++) {
+    const text = lines[n - 1] ?? ''
+    out.push(`${String(n).padStart(gutter, ' ')} |  ${text}`)
+    if (n === line) {
+      out.push(`${' '.repeat(gutter)} |  ${' '.repeat(Math.max(0, column))}^`)
+    }
+  }
+  return out.join('\n')
+}
+
+/**
+ * Turn Oxc's error list into one error that names the file and position.
+ * Oxc recovers from many syntax errors and still returns code, so upstream also
+ * treats a non-empty `errors` array as fatal in dev.
+ */
+function toTransformError(
+  errors: OxcError[],
+  code: string,
+  filename: string,
+): BrowserTransformError {
+  const primary = errors[0]
+  const label = primary.labels?.find((l) => typeof l.start === 'number')
+  const loc = label
+    ? {
+        file: filename.replace(/[?#].*$/, ''),
+        ...offsetToLineColumn(code, label.start),
+      }
+    : undefined
+  const details = errors
+    .map((e) =>
+      [e.message, e.helpMessage ? `help: ${e.helpMessage}` : '']
+        .filter(Boolean)
+        .join('\n'),
+    )
+    .join('\n')
+  const where = loc ? ` (${loc.file}:${loc.line}:${loc.column + 1})` : ''
+  return new BrowserTransformError(
+    `${details || '[browser-vite] Oxc transform failed'}${where}`,
+    filename,
+    loc,
+    loc ? generateCodeFrame(code, loc.line, loc.column) : undefined,
+  )
 }
 
 let oxcTransformSync: OxcWasmTransformSync | null = null
@@ -115,13 +240,19 @@ export async function transformWithOxc(
   const result = transformSync(filename, code, oxcOptions)
 
   if (result.errors?.length) {
-    throw new Error(
-      result.errors.map((e) => e.message).join('\n') ||
-        '[browser-vite] Oxc transform failed',
-    )
+    throw toTransformError(result.errors, code, filename)
   }
 
-  return { code: result.code, map: result.map ?? null }
+  // Oxc names the single source after the filename it was handed but omits the
+  // content; inline it so the preview (which has no HTTP origin able to serve
+  // `/src/App.tsx`) can still show original source in DevTools and code frames.
+  const map = ensureSourcesContent(
+    (result.map ?? null) as RawSourceMap | null,
+    filename,
+    code,
+  )
+
+  return { code: result.code, map }
 }
 
 /**
@@ -149,5 +280,7 @@ export function transformCssDev(
     modulesCode,
     `import.meta.hot.prune(() => __vite__removeStyle(__vite__id))`,
   ].join('\n')
-  return { code, map: { mappings: '' } }
+  // The dev CSS module is generated code, not a transform of the stylesheet —
+  // there is nothing to map back to (upstream returns an empty map here too).
+  return { code, map: null }
 }

@@ -18,6 +18,7 @@ import type { ImportSpecifier } from 'es-module-lexer'
 import type { ModuleGraph } from '../moduleGraph'
 import { handlePrunedModules, lexAcceptedHmrDeps } from '../hmr'
 import type { BrowserHmrEnvironment } from '../hmr'
+import type { RawSourceMap } from '../sourcemap'
 
 export interface ImportAnalysisOptions {
   moduleGraph: ModuleGraph
@@ -147,7 +148,7 @@ export async function importAnalysisTransform(
   source: string,
   importer: string,
   opts: ImportAnalysisOptions,
-): Promise<{ code: string; map: object | null } | null> {
+): Promise<{ code: string; map: RawSourceMap | null } | null> {
   const {
     moduleGraph,
     environment,
@@ -346,7 +347,14 @@ export async function importAnalysisTransform(
     if (pruned) handlePrunedModules(pruned, environment)
   }
 
-  return s ? { code: s.toString(), map: s.generateMap({ hires: 'boundary' }) } : { code: source, map: null }
+  if (!s) return { code: source, map: null }
+  // `source` here is the OXC OUTPUT, so this map's single source must be named
+  // after the module id — that is what lets `combineSourcemaps` chain it onto
+  // the oxc map instead of treating it as the final map back to original source.
+  return {
+    code: s.toString(),
+    map: s.generateMap({ hires: 'boundary', source: cleanUrl(importer) }),
+  }
 }
 
 function injectTimestamp(url: string, ts: number): string {

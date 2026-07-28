@@ -355,19 +355,6 @@ export async function installDependencies(
     // Install for many seconds.
     if (alreadyUnpacked(name, dep.version)) {
       log(`${name}@${dep.version}: already in VFS — skipped`);
-    } else if (name.startsWith('@types/')) {
-      // IntelliSense resolves decls through the host esm.sh import map, not
-      // `/node_modules/@types/*`. Unpack only a version marker so the install
-      // graph stays consistent without dragging multi‑MB DefinitelyTyped trees
-      // through the VFS on every cold load.
-      removeInstalledPackage(name);
-      withVirtualFileBatch(() => {
-        setVirtualFile(
-          `/node_modules/${name}/package.json`,
-          JSON.stringify({ name, version: dep.version, private: true }, null, 2),
-        );
-      });
-      log(`${name}@${dep.version}: types via esm.sh — skipped VFS unpack`);
     } else {
       // Clear any stale cached version of the same package so it can't shadow
       // the version the resolver actually picked, then unpack the tarball.

@@ -14,15 +14,29 @@ export const version = '8.1.5-browser.1'
 export {
   transformWithOxc,
   transformCssDev,
+  generateCodeFrame,
+  BrowserTransformError,
   type BrowserTransformOptions,
   type BrowserTransformResult,
+  type TransformErrorLocation,
 } from './transform'
+
+// Sourcemap chaining + inlining (browser analogue of node/server/sourcemap.ts)
+export {
+  combineSourcemaps,
+  ensureSourcesContent,
+  applySourcemapIgnoreList,
+  genSourceMapUrl,
+  getCodeWithSourcemap,
+  type RawSourceMap,
+} from './sourcemap'
 
 // Browser dev server (transformRequest + module serving, VFS-backed)
 export {
   BrowserServer,
   createBrowserServer,
   CLIENT_PUBLIC_PATH,
+  ERR_LOAD_URL,
   type BrowserServerOptions,
 } from './server'
 

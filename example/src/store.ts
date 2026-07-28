@@ -7,10 +7,19 @@ export interface VirtualFile {
   type: 'tsx' | 'ts' | 'css' | 'json' | 'html';
 }
 
+/** Dependency sources are read-only and live outside the project tree. */
+export const isDependencyPath = (path: string) => path.startsWith('/node_modules/');
+
 interface EditorState {
   /** VFS keyed by absolute path. Monaco models are the live edit buffers; this
    *  map is the durable source of truth that HMR syncs from. */
   fileSystem: Record<string, VirtualFile>;
+  /**
+   * Dependency sources opened from `/node_modules`, kept out of `fileSystem` so
+   * the explorer tree stays the project and HMR never sees them. Populated on
+   * demand (go-to-definition into a package) and read-only.
+   */
+  dependencyFiles: Record<string, VirtualFile>;
   currentFile: string | null;
   modifiedFiles: Record<string, true>;
   /** Open editor-tab paths, in tab order. The editor area is a tab strip over a
@@ -41,6 +50,8 @@ interface EditorState {
   replaceOpenTabs: (paths: string[], active: string | null) => void;
   /** Close a file tab; activates a sensible neighbour. */
   closeTab: (path: string) => void;
+  /** Open a read-only dependency source in a tab (go-to-definition target). */
+  openDependencyFile: (file: VirtualFile) => void;
   setFileContent: (path: string, content: string) => void;
   markModified: (path: string) => void;
   addFile: (file: VirtualFile) => void;
@@ -55,6 +66,7 @@ interface EditorState {
 export const useEditorStore = create<EditorState>()(
   immer((set) => ({
     fileSystem: {},
+    dependencyFiles: {},
     currentFile: null,
     modifiedFiles: {},
     openFiles: [],
@@ -84,10 +96,18 @@ export const useEditorStore = create<EditorState>()(
 
     openTab: (path) =>
       set((s) => {
-        if (!(path in s.fileSystem)) return;
+        if (!(path in s.fileSystem) && !(path in s.dependencyFiles)) return;
         if (!s.openFiles.includes(path)) s.openFiles.push(path);
         s.activeTab = path;
         s.currentFile = path;
+      }),
+
+    openDependencyFile: (file) =>
+      set((s) => {
+        s.dependencyFiles[file.path] = { ...file };
+        if (!s.openFiles.includes(file.path)) s.openFiles.push(file.path);
+        s.activeTab = file.path;
+        s.currentFile = file.path;
       }),
 
     activateTab: (id) =>
@@ -105,7 +125,9 @@ export const useEditorStore = create<EditorState>()(
     replaceOpenTabs: (paths, active) =>
       set((s) => {
         const hasFs = Object.keys(s.fileSystem).length > 0;
-        const next = hasFs ? paths.filter((p) => p in s.fileSystem) : [...paths];
+        const next = hasFs
+          ? paths.filter((p) => p in s.fileSystem || p in s.dependencyFiles)
+          : [...paths];
         // Preserve order; drop duplicates.
         s.openFiles = [...new Set(next)];
         if (active && (active === 'preview' || s.openFiles.includes(active))) {
@@ -122,6 +144,9 @@ export const useEditorStore = create<EditorState>()(
         const idx = s.openFiles.indexOf(path);
         if (idx === -1) return;
         s.openFiles.splice(idx, 1);
+        // Dependency sources are re-read from the VFS on demand, so don't hold
+        // a package's files in memory once its tab is gone.
+        delete s.dependencyFiles[path];
         if (s.activeTab === path) {
           const next = s.openFiles[idx - 1] ?? s.openFiles[idx] ?? null;
           s.activeTab = next;
@@ -177,7 +202,10 @@ export const useEditorStore = create<EditorState>()(
           else if (p.startsWith(prefix)) moved.push([p, to + '/' + p.slice(prefix.length)]);
         }
         for (const [oldP, newP] of moved) {
-          s.fileSystem[newP] = s.fileSystem[oldP];
+          // The record repeats its own path, so it has to move with the key:
+          // a stale `file.path` makes every consumer that iterates the map
+          // write the file back to its old location.
+          s.fileSystem[newP] = { ...s.fileSystem[oldP], path: newP };
           delete s.fileSystem[oldP];
           if (s.modifiedFiles[oldP]) {
             s.modifiedFiles[newP] = true;

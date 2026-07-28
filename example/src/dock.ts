@@ -116,51 +116,51 @@ export function closeFile(api: DockviewApi, path: string) {
 }
 
 /**
- * Scroll the group's tab strip so `path`'s tab chip is fully visible.
+ * Scroll the group's tab strip so `path`'s tab chip is fully visible. Every way
+ * a file reaches the editor — explorer click, restore, go-to-definition — ends
+ * up here, so the strip behaves identically for all of them.
  *
  * Dockview's own `setActivePanel` does try to scroll, but it runs before the
  * React `fileTab` content has laid out (width ≈ 0), so the new tab often stays
- * clipped behind the overflow control. Re-scroll after paint; for a newly
- * appended tab this lands at the end of the strip.
+ * clipped behind the overflow control. We re-scroll after paint, and keep
+ * re-applying for a few frames: tab labels paint progressively, so the strip
+ * keeps growing and a single pass undershoots the end.
  */
 export function revealFileTab(api: DockviewApi, path: string) {
   const attempt = (remaining: number) => {
-    const panel = api.getPanel(filePanelId(path));
-    if (!panel) {
+    const retry = () => {
       if (remaining > 0) requestAnimationFrame(() => attempt(remaining - 1));
-      return;
-    }
+    };
+    const panel = api.getPanel(filePanelId(path));
+    if (!panel) return retry();
 
     const tabsList = panel.group.element.querySelector<HTMLElement>('.dv-tabs-container');
-    const tab =
-      tabsList?.querySelector<HTMLElement>('.dv-tab.dv-active-tab') ??
-      tabsList?.querySelector<HTMLElement>('.dv-tab[aria-selected="true"]');
-    if (!tabsList || !tab || tab.offsetWidth === 0) {
-      if (remaining > 0) requestAnimationFrame(() => attempt(remaining - 1));
-      return;
-    }
+    if (!tabsList) return retry();
 
-    const tabs = tabsList.querySelectorAll<HTMLElement>('.dv-tab');
-    const isLast = tabs.length > 0 && tabs[tabs.length - 1] === tab;
-    // New files always append — jump to the end so the chip is fully visible.
-    if (isLast) {
-      tabsList.scrollLeft = tabsList.scrollWidth - tabsList.clientWidth;
-      return;
-    }
+    // Address the tab by its position in the group, NOT by "whichever tab is
+    // active": activation is asynchronous, so the active tab can still be the
+    // one we are navigating away from — which used to scroll the strip back to
+    // the old tab and leave the newly opened one off-screen.
+    const tabs = [...tabsList.querySelectorAll<HTMLElement>('.dv-tab')];
+    const tab = tabs[panel.group.panels.indexOf(panel)];
+    if (!tab || tab.offsetWidth === 0) return retry();
 
     const left = tab.offsetLeft;
     const right = left + tab.offsetWidth;
-    const viewLeft = tabsList.scrollLeft;
-    const viewRight = viewLeft + tabsList.clientWidth;
-    if (left < viewLeft) {
+    if (tab === tabs[tabs.length - 1]) {
+      // Newly opened files append, and pinning to the end also absorbs any
+      // further growth as the remaining labels paint.
+      tabsList.scrollLeft = tabsList.scrollWidth - tabsList.clientWidth;
+    } else if (left < tabsList.scrollLeft) {
       tabsList.scrollLeft = left;
-    } else if (right > viewRight) {
+    } else if (right > tabsList.scrollLeft + tabsList.clientWidth) {
       tabsList.scrollLeft = right - tabsList.clientWidth;
     }
+    retry();
   };
 
   // Double-rAF: first frame commits the tab node, second lets React paint the
-  // icon/label so offsetWidth is real. Extra frames cover deferred openFile
-  // retries and slow custom-tab mounts.
-  requestAnimationFrame(() => requestAnimationFrame(() => attempt(12)));
+  // icon/label so offsetWidth is real. The remaining frames cover deferred
+  // openFile retries, slow custom-tab mounts and late label layout.
+  requestAnimationFrame(() => requestAnimationFrame(() => attempt(20)));
 }

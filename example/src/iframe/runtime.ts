@@ -12,30 +12,47 @@
 
 declare const chobitsu: { setOnMessage(cb: (m: string) => void): void; sendRawMessage(m: string): void } | undefined;
 
+import {
+  registerModule,
+  shiftMappings,
+  withInlineSourceMap,
+  installStackTraceInterceptor,
+  mapPosition,
+  remapStackString,
+  firstMappedFrame,
+  codeFrame,
+  type CodeEdit,
+  type RawSourceMap,
+} from './sourcemap';
+
 interface HotUpdate {
   type: 'js-update' | 'css-update';
   timestamp: number;
   path: string;
   acceptedPath: string;
 }
+interface ErrorDetail {
+  message: string
+  stack?: string
+  frame?: string
+  plugin?: string
+  loc?: { file?: string; line: number; column: number }
+  id?: string
+}
+
 type Payload =
   | { type: 'connected' }
   | { type: 'ping' }
   | { type: 'update'; updates: HotUpdate[] }
   | { type: 'full-reload'; path?: string }
   | { type: 'prune'; paths: string[] }
-  | {
-      type: 'error'
-      err: {
-        message: string
-        stack?: string
-        frame?: string
-        plugin?: string
-        loc?: { file?: string; line: number; column: number }
-        id?: string
-      }
-    }
+  | { type: 'error'; err: ErrorDetail }
   | { type: 'custom'; event: string; data?: unknown };
+
+/** A rejected module fetch carries the server's error payload on the Error. */
+interface ServerFailure extends Error {
+  detail?: ErrorDetail;
+}
 
 type Lexer = {
   init: Promise<unknown>;
@@ -49,20 +66,99 @@ function hmrLog(msg: string): void {
   post('hmr-log', { message: msg });
 }
 
-// Surface exact SyntaxError location (source + line:col) to the host.
+// Must run before ANY module is imported: from here on every `error.stack` in
+// the preview is rendered at original source positions.
+installStackTraceInterceptor();
+
+/**
+ * Render a server-side (transform / load) failure. The position and code frame
+ * come from the server, which had the ORIGINAL source in hand — there is no
+ * stack to map here, and the module never existed in the iframe.
+ */
+function showServerError(title: string, err: ErrorDetail): void {
+  // `loc.column` is 0-based (Rollup/Vite convention); display it 1-based so it
+  // matches what the editor's status bar shows.
+  const loc = err.loc
+    ? `${err.loc.file || err.id || ''}:${err.loc.line}:${err.loc.column + 1}`
+    : err.id;
+  hmrLog(`${title}: ${err.message}${loc ? ` (${loc})` : ''}`);
+  showErrorOverlay(title, err.message, err.frame ? undefined : err.stack, {
+    frame: err.frame,
+    plugin: err.plugin,
+    loc,
+  });
+}
+
+/** Report a runtime error to the host with a source-mapped stack + code frame. */
+function reportRuntimeError(kind: string, err: unknown, fallbackLocation?: string): void {
+  const failure = err as ServerFailure;
+  if (failure?.detail) {
+    // A failed transform is a build error, not a runtime one, no matter which
+    // phase happened to request the module.
+    showServerError(failure.detail.plugin ? 'Transform Error' : kind, failure.detail);
+    return;
+  }
+  const error = err instanceof Error ? err : new Error(String(err));
+  // Reading `.stack` runs the interceptor; blob positions that slip through
+  // (or non-V8 engines) are caught by the string remapper.
+  const stack = remapStackString(error.stack);
+  const frame = firstMappedFrame(error.stack);
+  const loc = frame
+    ? `${frame.source}:${frame.line}:${frame.column}`
+    : fallbackLocation;
+  showErrorOverlay(kind, error.message, stack, {
+    loc,
+    frame: frame ? codeFrame(frame.source, frame.line, frame.column) : undefined,
+  });
+  post('runtime-error', {
+    kind,
+    message: error.message,
+    stack,
+    file: frame?.source,
+    line: frame?.line,
+    column: frame?.column,
+  });
+}
+
+// Uncaught errors and rejections previously died in the iframe console. Surface
+// them like Vite's overlay does, at real file positions.
 window.addEventListener(
   'error',
   (e: ErrorEvent) => {
+    // A module parse error has no stack — the event's own position is the only
+    // location, and it points into the blob, so map it explicitly.
+    const mapped = e.filename ? mapPosition(e.filename, e.lineno, e.colno) : null;
+    const location = mapped
+      ? `${mapped.source}:${mapped.line}:${mapped.column}`
+      : e.filename
+        ? `${e.filename}:${e.lineno}:${e.colno}`
+        : undefined;
+
     if (e.error instanceof SyntaxError || /SyntaxError/.test(e.message)) {
-      hmrLog(`SYNTAX ${e.message} @ ${e.filename || '?'}:${e.lineno}:${e.colno}`);
+      hmrLog(`SYNTAX ${e.message} @ ${location ?? '?'}`);
+      showErrorOverlay('Syntax Error', e.message, undefined, {
+        loc: location,
+        frame: mapped ? codeFrame(mapped.source, mapped.line, mapped.column) : undefined,
+      });
+      return;
     }
+    if (e.error) reportRuntimeError('Runtime Error', e.error, location);
   },
   true,
 );
 
+window.addEventListener('unhandledrejection', (e: PromiseRejectionEvent) => {
+  reportRuntimeError('Unhandled Rejection', e.reason);
+});
+
 // /@vite/client + /@react-refresh module URLs, provided by the host.
 const CLIENT_MOD_URL = (window as unknown as { __VITE_CLIENT_URL: string }).__VITE_CLIENT_URL;
 const REACT_REFRESH_URL = (window as unknown as { __REACT_REFRESH_URL: string }).__REACT_REFRESH_URL;
+
+// These two are blob-ified by the bootstrap before this module runs, so they
+// never pass through `serveModule`. Name them so their frames are readable.
+registerModule(CLIENT_MOD_URL, '/@vite/client', null);
+registerModule(REACT_REFRESH_URL, '/@react-refresh', null);
 
 /**
  * Resolve a specifier to a directly-importable URL, or null to fall through
@@ -81,7 +177,6 @@ const hotModulesMap = new Map<string, { id: string; callbacks: Array<{ deps: str
 const disposeMap = new Map<string, (data: unknown) => void | Promise<void>>();
 const pruneMap = new Map<string, (data: unknown) => void | Promise<void>>();
 const dataMap = new Map<string, unknown>();
-const blobUrls = new Map<string, string>();
 
 let updateCount = 0;
 
@@ -98,7 +193,15 @@ function lexer(): Promise<Lexer> {
   return lexerPromise;
 }
 
-async function linkModule(code: string, forPath = ''): Promise<string> {
+/**
+ * Rewrite every import specifier to a directly-importable blob URL, reporting
+ * the edits so the module's sourcemap can be re-based (blob URLs are much longer
+ * than the specifiers they replace, which moves every column after them).
+ */
+async function linkModule(
+  code: string,
+  forPath = '',
+): Promise<{ code: string; edits: CodeEdit[] }> {
   const { parse } = await lexer();
   let imports: Array<{ n?: string; s: number; e: number; d: number }>;
   try {
@@ -124,6 +227,7 @@ async function linkModule(code: string, forPath = ''): Promise<string> {
     }
   }
   let out = code;
+  const edits: CodeEdit[] = [];
   for (let i = imports.length - 1; i >= 0; i--) {
     const imp = imports[i];
     if (imp.n === undefined) continue;
@@ -131,9 +235,13 @@ async function linkModule(code: string, forPath = ''): Promise<string> {
     if (!resolved) continue;
     const sPos = imp.d > -1 ? imp.s : imp.s - 1;
     const ePos = imp.d > -1 ? imp.e : imp.e + 1;
-    out = out.slice(0, sPos) + JSON.stringify(resolved) + out.slice(ePos);
+    const replacement = JSON.stringify(resolved);
+    // Offsets are against the pre-edit code (the loop runs backwards), which is
+    // the coordinate space `shiftMappings` works in.
+    edits.push({ start: sPos, removed: ePos - sPos, inserted: replacement.length });
+    out = out.slice(0, sPos) + replacement + out.slice(ePos);
   }
-  return out;
+  return { code: out, edits };
 }
 
 /** Resolve a (possibly relative) import specifier against its importer path. */
@@ -150,14 +258,26 @@ function resolveImportSpecifier(spec: string, importer: string): string {
   return spec;
 }
 
-function fetchModuleCode(path: string): Promise<string> {
+interface ServedModule {
+  code: string;
+  map: RawSourceMap | null;
+}
+
+function fetchModuleCode(path: string): Promise<ServedModule> {
   return new Promise((resolve, reject) => {
     const id = 'serve-' + Math.random().toString(36).slice(2);
     function onMsg(event: MessageEvent): void {
       if (event.data && event.data.type === 'hmr-module' && event.data.id === id) {
         window.removeEventListener('message', onMsg);
-        if (event.data.error) reject(new Error(event.data.error));
-        else resolve(event.data.code);
+        if (event.data.error) {
+          // Carry the server's loc/frame through the rejection so the overlay
+          // can show the transform's real position, not this listener's frame.
+          const failure: ServerFailure = new Error(event.data.error);
+          failure.detail = event.data.errorDetail;
+          reject(failure);
+        } else {
+          resolve({ code: event.data.code, map: event.data.map ?? null });
+        }
       }
     }
     window.addEventListener('message', onMsg);
@@ -184,10 +304,17 @@ async function serveModule(url: string): Promise<string> {
     if (existing) return existing;
   }
   const raw = await fetchModuleCode(clean);
-  const code = await linkModule(raw, clean);
+  const linked = await linkModule(raw.code, clean);
+  // Re-base the map onto the linked code, then inline it so the iframe's own
+  // DevTools resolves original sources (there is no origin that could serve a
+  // separate .map for a VFS file).
+  const map = raw.map ? shiftMappings(raw.map, raw.code, linked.edits) : null;
+  const code = withInlineSourceMap(linked.code, map);
   const blobUrl = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+  // Register even when there is no map: frames then read `/@deps/react.js`
+  // rather than an opaque blob id.
+  registerModule(blobUrl, clean, map);
   moduleBlobByPath.set(clean, blobUrl);
-  blobUrls.set(url, blobUrl);
   return blobUrl;
 }
 
@@ -272,15 +399,34 @@ function escapeHtml(s: string): string {
     .replace(/"/g, '&quot;');
 }
 
-// Error overlay lives in a SEPARATE container so it never clobbers #root —
-// otherwise React's root (created against #root's original children) loses
-// its container content and a later successful update cannot recover.
-function showErrorOverlay(
-  title: string,
-  message: string,
-  stack?: string,
-  extra?: { frame?: string; plugin?: string; loc?: string },
-): void {
+// The module the page boots from (declared by /index.html), and whether it has
+// actually executed. A hot update that applies cleanly does NOT mean the app is
+// healthy while its entry never ran — the update swaps a module in a graph no
+// live app was built from — so it must not clear the error that is still true.
+let entryPath: string | null = null;
+let entryBooted = false;
+
+// Markup currently rendered in the overlay. A single broken file can produce
+// several identical `error` payloads (the server broadcasts one per failed
+// transform, and the import that follows rejects with the same message);
+// re-writing the same markup would repaint the overlay and make it flicker.
+let overlayHtml = '';
+
+// Quiet window for painting the overlay. A structural burst (delete folder,
+// missing entry + cascading import failures) produces many distinct errors in
+// rapid succession; showing each one looks like flashing. Keep the latest and
+// paint once the channel settles — same SETTLE_MS as the host transport.
+const OVERLAY_SETTLE_MS = 120;
+type OverlayPaint = {
+  title: string;
+  message: string;
+  stack?: string;
+  extra?: { frame?: string; plugin?: string; loc?: string };
+};
+let pendingOverlay: OverlayPaint | null = null;
+let overlayTimer: ReturnType<typeof setTimeout> | null = null;
+
+function paintErrorOverlay(paint: OverlayPaint): void {
   let overlay = document.getElementById('hmr-error-overlay');
   if (!overlay) {
     overlay = document.createElement('div');
@@ -291,14 +437,21 @@ function showErrorOverlay(
   // Escape HTML — JSX/parse errors routinely contain `<`/`>` and would otherwise
   // break the overlay markup (empty / half-rendered "error state").
   const meta = [
-    extra?.plugin ? `[plugin: ${extra.plugin}]` : '',
-    extra?.loc ? extra.loc : '',
+    paint.extra?.plugin ? `[plugin: ${paint.extra.plugin}]` : '',
+    paint.extra?.loc ? paint.extra.loc : '',
   ]
     .filter(Boolean)
     .join(' ');
-  const body = [meta, message, extra?.frame, stack].filter(Boolean).join('\n');
-  overlay.innerHTML =
-    '<h2>' + escapeHtml(title) + '</h2><pre>' + escapeHtml(body) + '</pre>';
+  // Any stack reaching the overlay goes through the remapper — host-side
+  // payloads arrive as plain strings that never hit `prepareStackTrace`.
+  const body = [meta, paint.message, paint.extra?.frame, remapStackString(paint.stack)]
+    .filter(Boolean)
+    .join('\n');
+  const html = '<h2>' + escapeHtml(paint.title) + '</h2><pre>' + escapeHtml(body) + '</pre>';
+  if (html !== overlayHtml) {
+    overlay.innerHTML = html;
+    overlayHtml = html;
+  }
   overlay.style.display = 'block';
   // Lock background scroll while the overlay is up (the overlay itself still
   // scrolls its own content via overflow:auto).
@@ -306,14 +459,50 @@ function showErrorOverlay(
   document.documentElement.style.overflow = 'hidden';
 }
 
+// Error overlay lives in a SEPARATE container so it never clobbers #root —
+// otherwise React's root (created against #root's original children) loses
+// its container content and a later successful update cannot recover.
+function showErrorOverlay(
+  title: string,
+  message: string,
+  stack?: string,
+  extra?: { frame?: string; plugin?: string; loc?: string },
+): void {
+  pendingOverlay = { title, message, stack, extra };
+  if (overlayTimer !== null) clearTimeout(overlayTimer);
+  overlayTimer = setTimeout(() => {
+    overlayTimer = null;
+    const paint = pendingOverlay;
+    pendingOverlay = null;
+    if (paint) paintErrorOverlay(paint);
+  }, OVERLAY_SETTLE_MS);
+}
+
 function clearErrorOverlay(): void {
+  if (overlayTimer !== null) {
+    clearTimeout(overlayTimer);
+    overlayTimer = null;
+  }
+  pendingOverlay = null;
   const overlay = document.getElementById('hmr-error-overlay');
   if (overlay) overlay.style.display = 'none';
+  overlayHtml = '';
   document.body.style.overflow = '';
   document.documentElement.style.overflow = '';
 }
 
-async function applyJsUpdate(update: HotUpdate): Promise<void> {
+type UpdateFailure = {
+  err: unknown
+  path: string
+  /** Server already broadcast an `error` HotPayload for this — don't paint twice. */
+  serverReported: boolean
+};
+
+/**
+ * Apply one js-update. Returns a failure instead of painting so a coalesced
+ * batch can settle on a single overlay message.
+ */
+async function applyJsUpdate(update: HotUpdate): Promise<UpdateFailure | null> {
   const { path, acceptedPath, timestamp } = update;
   hmrLog(`js-update path=${path} acceptedPath=${acceptedPath} t=${timestamp}`);
   const mod = hotModulesMap.get(path);
@@ -339,16 +528,19 @@ async function applyJsUpdate(update: HotUpdate): Promise<void> {
         fn(deps.map((d) => (d === acceptedPath ? fetchedModule : undefined)));
       }
     }
-    // The update applied cleanly — any prior error state is now stale.
-    clearErrorOverlay();
     hmrLog('hot updated: ' + acceptedPath + (path !== acceptedPath ? ' via ' + path : ''));
+    return null;
   } catch (err) {
-    // A js-update that fails to import/execute (e.g. the new module still has
-    // a syntax/runtime error) must surface as an overlay, not vanish silently
-    // — and must NOT clear an existing overlay.
+    // A js-update that fails to import/execute must not vanish silently — and
+    // must NOT clear an existing overlay. The caller paints once after the
+    // whole coalesced batch so intermediate failures don't flash.
     const e = err as Error;
     hmrLog('HMR update failed: ' + e.message);
-    showErrorOverlay('HMR Error', e.message, e.stack);
+    // transformRequest already pushed an `error` HotPayload for load/transform
+    // misses ("Failed to load url…"). Painting from the import rejection too
+    // would show the same failure twice, a fetch-round-trip apart.
+    const serverReported = /Failed to load url|Does the file exist\?/.test(e.message);
+    return { err, path: acceptedPath, serverReported };
   }
 }
 
@@ -357,8 +549,11 @@ async function handlePayload(payload: Payload): Promise<void> {
     case 'connected':
       hmrLog('Vite HMR connected');
       break;
-    case 'update':
+    case 'update': {
       hmrLog('Received update with ' + payload.updates.length + ' change(s)');
+      let lastFailure: UpdateFailure | null = null;
+      let awaitingServerError = false;
+      let anySuccess = false;
       for (const update of payload.updates) {
         if (update.type === 'css-update') {
           post('hmr-fetch-module', {
@@ -368,11 +563,24 @@ async function handlePayload(payload: Payload): Promise<void> {
             css: true,
           });
           hmrLog('css-update ' + update.path);
+          anySuccess = true;
         } else {
-          await applyJsUpdate(update);
+          const failure = await applyJsUpdate(update);
+          if (failure) {
+            if (failure.serverReported) awaitingServerError = true;
+            else lastFailure = failure;
+          } else {
+            anySuccess = true;
+          }
         }
       }
+      // One overlay for the whole coalesced batch. Load/transform misses are
+      // owned by the server's `error` payload (already in flight); only paint
+      // execution errors here. Don't clear when we're waiting on that payload.
+      if (lastFailure) reportRuntimeError('HMR Error', lastFailure.err, lastFailure.path);
+      else if (anySuccess && entryBooted && !awaitingServerError) clearErrorOverlay();
       break;
+    }
     case 'full-reload':
       hmrLog('full-reload' + (payload.path ? ' path=' + payload.path : ''));
       post('hmr-full-reload-ack', { path: payload.path });
@@ -393,20 +601,25 @@ async function handlePayload(payload: Payload): Promise<void> {
       break;
     case 'error': {
       const { err } = payload;
-      hmrLog('HMR Error: ' + err.message);
-      const loc = err.loc
-        ? `${err.loc.file || err.id || ''}:${err.loc.line}:${err.loc.column}`
-        : err.id;
-      showErrorOverlay('HMR Error', err.message, err.stack, {
-        frame: err.frame,
-        plugin: err.plugin,
-        loc,
-      });
+      // The entry failing to load invalidates the running app, even though this
+      // document was never reloaded (the host skips reloads it knows will fail).
+      if (err.id && err.id === entryPath) entryBooted = false;
+      showServerError('HMR Error', err);
       break;
     }
     default:
       break;
   }
+}
+
+// Serialize HotPayload handling: the host may postMessage several payloads
+// back-to-back, and an un-awaited async handler would let them race — e.g. an
+// `error` painting while an earlier `update` is still fetching modules.
+let payloadChain: Promise<void> = Promise.resolve();
+function enqueuePayload(payload: Payload): void {
+  payloadChain = payloadChain.then(() => handlePayload(payload)).catch((err) => {
+    hmrLog('payload handler failed: ' + (err instanceof Error ? err.message : String(err)));
+  });
 }
 
 window.addEventListener('message', async (event: MessageEvent) => {
@@ -421,7 +634,7 @@ window.addEventListener('message', async (event: MessageEvent) => {
     hmrLog('CSS injected without reload');
   }
   if (event.data && event.data.type === 'vite-hmr' && event.data.payload) {
-    handlePayload(event.data.payload);
+    enqueuePayload(event.data.payload);
   }
   if (event.data && event.data.type === 'hmr-update') {
     updateCount++;
@@ -432,23 +645,20 @@ window.addEventListener('message', async (event: MessageEvent) => {
       // self-executing: it imports react-dom/client and calls
       // createRoot().render() itself — exactly like a real Vite scaffold. The
       // runtime no longer renders the entry's default export.
-      const entry = event.data.entry || '/src/main.tsx';
+      const entry: string = event.data.entry || '/src/main.tsx';
+      entryPath = entry;
       await import(await serveModule(entry));
+      entryBooted = true;
       clearErrorOverlay();
       hmrLog('Bootstrap render complete');
     } catch (err) {
+      entryBooted = false;
+      // Previously this dumped every served blob's full text into the host log
+      // as a last-resort debugging aid. A source-mapped stack points at the
+      // actual line instead, so the dump is pure noise now.
       const e = err as Error;
-      let dump = '';
-      for (const [u, b] of blobUrls) {
-        try {
-          const t = await (await fetch(b)).text();
-          dump += '\n=== ' + u + ' ===\n' + t;
-        } catch {
-          /* ignore */
-        }
-      }
-      hmrLog('HMR Error: ' + e.message + dump);
-      showErrorOverlay('HMR Error', e.message, e.stack);
+      hmrLog('Bootstrap failed: ' + e.message);
+      reportRuntimeError('Bootstrap Error', e);
     }
   }
   if (event.data && event.data.type === 'cdp-command' && typeof chobitsu !== 'undefined') {
