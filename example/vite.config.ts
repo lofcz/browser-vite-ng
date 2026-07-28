@@ -427,8 +427,26 @@ function monacoModulesPlugin(): Plugin {
   // expose ./package.json or a resolvable main for require.resolve).
   const monacoRoot = path.resolve(__dirname, 'node_modules', 'modern-monaco');
   const serve = (rel: string) => path.join(monacoRoot, rel);
+  // Resolved Vite base ('/' locally, '/browser-vite-ng/' on GitHub Pages). The
+  // importmap in index.html hardcodes root-absolute /monaco/* URLs, which drop
+  // the base path under a sub-path deploy; we rewrite them with the base here.
+  let base = '/';
   return {
     name: 'monaco-modules',
+    configResolved(config) {
+      base = config.base;
+    },
+    // Prefix the importmap's /monaco/* URLs (and the /src/main.tsx entry) with
+    // the deploy base so they resolve under e.g. /browser-vite-ng/ on Pages.
+    // The monaco runtime builds nested module URLs relative to these entries,
+    // so base-qualifying the two roots cascades to every lazy import.
+    transformIndexHtml(html) {
+      if (base === '/') return html;
+      const b = base.endsWith('/') ? base.slice(0, -1) : base;
+      return html
+        .replace(/"\/monaco\//g, `"${b}/monaco/`)
+        .replace(/src="\/src\//g, `src="${b}/src/`);
+    },
     // Production: the dev middleware below doesn't exist in a static build, so
     // emit the monaco runtime files at the SAME /monaco/* (and root /*.mjs)
     // URLs the page importmap + lazy runtime imports resolve to. Mirrors the
