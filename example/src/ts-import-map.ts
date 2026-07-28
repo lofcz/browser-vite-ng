@@ -17,10 +17,22 @@
 
 export type InstalledDep = { name: string; version: string };
 
-/** Origin-absolute `/esm-sh/...` base for a package@version. */
+/**
+ * Base URL for a package@version's type declarations.
+ *
+ * Dev uses the same-origin `/esm-sh/*` Vite proxy so `.d.ts` fetches work
+ * offline and under COEP: require-corp. The static production build has no
+ * dev middleware (the proxy is configureServer-only), so there we go straight
+ * to esm.sh — its responses carry CORS (`Access-Control-Allow-Origin: *`),
+ * which is enough for the worker's plain `fetch` (verified: status 200 under
+ * cross-origin isolation). The proxy remains for any stricter subresource
+ * loads, but those only happen in dev.
+ */
 function esmShBase(name: string, version: string): string {
-  const origin = typeof location !== 'undefined' ? location.origin : '';
-  return `${origin}/esm-sh/${name}@${version}`;
+  const base = import.meta.env.DEV
+    ? `${typeof location !== 'undefined' ? location.origin : ''}/esm-sh`
+    : 'https://esm.sh';
+  return `${base}/${name}@${version}`;
 }
 
 /** DefinitelyTyped name for a runtime package. */

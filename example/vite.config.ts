@@ -429,6 +429,57 @@ function monacoModulesPlugin(): Plugin {
   const serve = (rel: string) => path.join(monacoRoot, rel);
   return {
     name: 'monaco-modules',
+    // Production: the dev middleware below doesn't exist in a static build, so
+    // emit the monaco runtime files at the SAME /monaco/* (and root /*.mjs)
+    // URLs the page importmap + lazy runtime imports resolve to. Mirrors the
+    // dev resolver's mapping: dist/<rest> and dist/lsp/<rest>.
+    closeBundle() {
+      const outDir = path.resolve(__dirname, 'dist');
+      const distDir = path.join(monacoRoot, 'dist');
+      const copy = (src: string, destRel: string) => {
+        if (!fs.existsSync(src)) return;
+        const dest = path.join(outDir, destRel);
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.copyFileSync(src, dest);
+      };
+      if (!fs.existsSync(distDir)) return;
+      for (const entry of fs.readdirSync(distDir, { withFileTypes: true })) {
+        if (entry.isFile() && entry.name.endsWith('.mjs')) {
+          // Top-level modules reachable at BOTH /monaco/<name>.mjs and the
+          // bare /<name>.mjs (nested lsp modules escape the prefix).
+          copy(path.join(distDir, entry.name), path.join('monaco', entry.name));
+          copy(path.join(distDir, entry.name), entry.name);
+        }
+      }
+      const lspDir = path.join(distDir, 'lsp');
+      const copyLsp = (dir: string, rel: string) => {
+        if (!fs.existsSync(dir)) return;
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const entryRel = rel ? path.join(rel, entry.name) : entry.name;
+          if (entry.isDirectory()) copyLsp(path.join(dir, entry.name), entryRel);
+          else if (entry.isFile() && entry.name.endsWith('.mjs'))
+            copy(path.join(dir, entry.name), path.join('monaco', 'lsp', entryRel));
+        }
+      };
+      copyLsp(lspDir, '');
+      // Dev maps /monaco/lsp.mjs → dist/lsp/index.mjs; emit the same alias so
+      // the page importmap (modern-monaco/lsp → /monaco/lsp.mjs) resolves.
+      copy(path.join(distDir, 'lsp', 'index.mjs'), path.join('monaco', 'lsp.mjs'));
+      // The runtime flattens nested lsp imports to /monaco/<sub>/<file>.mjs
+      // (dropping the `lsp/` segment); the dev resolver falls back to
+      // dist/lsp/<rest> for any /monaco/* it can't find at dist/<rest>. Mirror
+      // that fallback so e.g. /monaco/css/setup.mjs → dist/lsp/css/setup.mjs.
+      const copyLspFlat = (dir: string, rel: string) => {
+        if (!fs.existsSync(dir)) return;
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const entryRel = rel ? path.join(rel, entry.name) : entry.name;
+          if (entry.isDirectory()) copyLspFlat(path.join(dir, entry.name), entryRel);
+          else if (entry.isFile() && entry.name.endsWith('.mjs'))
+            copy(path.join(dir, entry.name), path.join('monaco', entryRel));
+        }
+      };
+      copyLspFlat(lspDir, '');
+    },
     configureServer(server) {
       server.middlewares.use((req, res, next) => {
         const url = (req.url ?? '').split('?')[0];

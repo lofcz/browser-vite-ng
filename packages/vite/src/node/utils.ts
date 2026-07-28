@@ -212,8 +212,17 @@ export function createDebugger(
 
 function testCaseInsensitiveFS() {
   // BROWSER VITE patch: the fork's VFS has no on-disk client.mjs to probe.
-  // Virtual paths are case-sensitive; treat the FS as case-sensitive.
-  if (process.env.VITE_BROWSER) return false
+  // Virtual paths are case-sensitive; treat the FS as case-sensitive. Detect
+  // the fork by CLIENT_ENTRY resolving to its virtual client path rather than
+  // process.env.VITE_BROWSER, which is timing-dependent in the production
+  // bundle (utils can evaluate before the globals shim installs
+  // globalThis.process, leaving the env var unset while CLIENT_ENTRY still
+  // points at the virtual '/dist/client/client.mjs').
+  if (
+    process.env.VITE_BROWSER ||
+    /(^|\/)dist\/client\/client\.mjs$/.test(CLIENT_ENTRY)
+  )
+    return false
   if (!CLIENT_ENTRY.endsWith('client.mjs')) {
     throw new Error(
       `cannot test case insensitive FS, CLIENT_ENTRY const doesn't contain client.mjs`,
