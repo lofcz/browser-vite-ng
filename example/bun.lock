@@ -6,6 +6,7 @@
       "name": "browser-vite-example",
       "dependencies": {
         "@jridgewell/remapping": "^2.3.5",
+        "@jridgewell/sourcemap-codec": "^1.5.5",
         "@jridgewell/trace-mapping": "^0.3.31",
         "@napi-rs/wasm-runtime": "^1.1.6",
         "@oxc-transform/binding-wasm32-wasi": "^0.108.0",
@@ -49,7 +50,7 @@
         "immer": "^11.1.15",
         "launch-editor-middleware": "^2.14.1",
         "mlly": "^1.8.2",
-        "modern-monaco": "npm:@lofcz/modern-monaco@^0.3.1",
+        "modern-monaco": "npm:@lofcz/modern-monaco@^0.3.2",
         "mrmime": "^2.0.1",
         "obug": "^2.1.4",
         "open": "^11.0.0",
@@ -839,7 +840,7 @@
 
     "mlly": ["mlly@1.8.2", "", { "dependencies": { "acorn": "^8.16.0", "pathe": "^2.0.3", "pkg-types": "^1.3.1", "ufo": "^1.6.3" } }, "sha512-d+ObxMQFmbt10sretNDytwt85VrbkhhUA/JBGm1MPaWJ65Cl4wOgLaB1NYvJSZ0Ef03MMEU/0xpPMXUIQ29UfA=="],
 
-    "modern-monaco": ["@lofcz/modern-monaco@0.3.1", "", { "peerDependencies": { "typescript": ">= 6.0.0" } }, "sha512-ErUgKCKt7vE3jryPBX9ZxhNeTf/WlecILyi0ZIDr+eyod/oGgwWNzmvKKqwF55ymFD24D/DdLfeBN5qJF8TssA=="],
+    "modern-monaco": ["@lofcz/modern-monaco@0.3.2", "", { "peerDependencies": { "typescript": ">= 6.0.0" } }, "sha512-vZJP29GulkcXtaFD1a3eV1x4Fs/c426165UqXztYjKy7XqiZYaHct0wgwrfkkg3ogUXb14L11wK0FrO7ECyfMw=="],
 
     "mrmime": ["mrmime@2.0.1", "", {}, "sha512-Y3wQdFg2Va6etvQ5I82yUhGdsKrcYox6p7FfL1LbK2J4V01F9TGlepTIhnK24t7koZibmg82KGglhA1XK5IsLQ=="],
 
