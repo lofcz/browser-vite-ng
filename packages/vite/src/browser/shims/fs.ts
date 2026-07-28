@@ -215,6 +215,55 @@ export function createWriteStream() {
   return undefined;
 }
 
+// ---- File-descriptor API -----------------------------------------------------
+// Minimal fd table over the VFS so `openSync`/`readSync`/`closeSync` work for
+// deps (tinyexec) that read a file by descriptor instead of `readFileSync`.
+
+interface OpenFd {
+  path: string;
+  data: Uint8Array;
+  pos: number;
+}
+const fds = new Map<number, OpenFd>();
+let nextFd = 3; // 0/1/2 are stdin/stdout/stderr
+
+export function openSync(p: PathLike, _flags?: string | number, _mode?: number): number {
+  const path = toPath(p);
+  const content = readVirtualFile(path);
+  if (content === undefined) throw createNodeError('ENOENT', 'open', path);
+  const fd = nextFd++;
+  fds.set(fd, { path, data: encoder.encode(content), pos: 0 });
+  return fd;
+}
+
+export function closeSync(fd: number): void {
+  fds.delete(fd);
+}
+
+export function readSync(
+  fd: number,
+  buffer: Uint8Array,
+  offset: number,
+  length: number,
+  position: number | null,
+): number {
+  const entry = fds.get(fd);
+  if (!entry) throw createNodeError('EBADF', 'read', String(fd));
+  const start = position ?? entry.pos;
+  if (start >= entry.data.length) return 0;
+  const slice = entry.data.subarray(start, start + length);
+  buffer.set(slice, offset);
+  const bytesRead = slice.length;
+  if (position === null) entry.pos += bytesRead;
+  return bytesRead;
+}
+
+export function fstatSync(fd: number) {
+  const entry = fds.get(fd);
+  if (!entry) throw createNodeError('EBADF', 'fstat', String(fd));
+  return makeStats(entry.path, false, entry.data.length);
+}
+
 // ---- Callback-style async API ----------------------------------------------
 
 type Cb<T> = (err: Error | null, result?: T) => void;
@@ -329,6 +378,10 @@ export default {
   unwatchFile,
   createReadStream,
   createWriteStream,
+  openSync,
+  closeSync,
+  readSync,
+  fstatSync,
   readFile,
   stat,
   lstat,

@@ -280,6 +280,7 @@ const BUILTIN_SHIMS: Record<string, string> = {
   crypto: 'crypto.ts',
   buffer: 'buffer.ts',
   stream: 'stream.ts',
+  'stream/promises': 'stream-promises.ts',
   events: 'events.ts',
   tty: 'tty.ts',
   querystring: 'querystring.ts',

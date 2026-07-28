@@ -390,4 +390,28 @@ export function createProcess(options?: {
 // Default process instance
 export const process = createProcess();
 
+// Named top-level exports mirroring `node:process` — some deps (tinyexec) use
+// `import { cwd } from 'node:process'` instead of the default `process.cwd()`.
+export const cwd = process.cwd.bind(process);
+export const chdir = process.chdir.bind(process);
+export const env = process.env;
+export const platform = process.platform;
+export const version = process.version;
+export const versions = process.versions;
+export const argv = process.argv;
+export const argv0 = process.argv0;
+export const execPath = process.execPath;
+export const execArgv = process.execArgv;
+export const pid = process.pid;
+export const ppid = process.ppid;
+export const stdout = process.stdout;
+export const stderr = process.stderr;
+export const stdin = process.stdin;
+export const hrtime = process.hrtime;
+export const exit = process.exit.bind(process);
+export const nextTick = process.nextTick.bind(process);
+export const memoryUsage = process.memoryUsage.bind(process);
+export const uptime = process.uptime.bind(process);
+export const cpuUsage = process.cpuUsage.bind(process);
+
 export default process;
