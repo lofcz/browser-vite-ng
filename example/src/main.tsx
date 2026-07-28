@@ -4,24 +4,60 @@
  * Features:
  * - Virtual file system with multiple files
  * - Browsable file tree
- * - CodeMirror editor for editing code
+ * - Monaco editor (modern-monaco) for editing code
  * - Live preview in iframe with HMR
  * - Module resolution between files
  */
 
+// Install Node globals (process, Buffer) BEFORE any browser-vite/dep code runs.
+import 'browser-vite/shims/globals';
+
 import './index.css';
-import { EditorView, basicSetup } from 'codemirror';
-import { javascript } from '@codemirror/lang-javascript';
-import { css } from '@codemirror/lang-css';
-import { html } from '@codemirror/lang-html';
-import { oneDark } from '@codemirror/theme-one-dark';
-import { EditorState } from '@codemirror/state';
+import './vscode-explorer.css';
+
+// react-scan: render-performance inspector. Localhost/dev only — never shipped
+// in the production (GitHub Pages) build.
+if (import.meta.env.DEV) {
+  const s = document.createElement('script');
+  s.src = 'https://unpkg.com/react-scan/dist/auto.global.js';
+  s.async = true;
+  document.head.appendChild(s);
+}
+
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import { init, Workspace } from 'modern-monaco';
+import { editorStore, useEditorStore, type VirtualFile } from './store';
+import { VFSFileSystem } from './monaco-fs';
+import { bindBrowserVite, bindMonacoHooks } from './fs-ops';
+import { App } from './App';
+import {
+  shellRefs,
+  bindShellActions,
+  setShellReady,
+  setStatusBar,
+  shellReady,
+  onDevtoolsOpen,
+  onPreviewOpen,
+  previewMounted,
+  devtoolsMounted,
+} from './shell-bridge';
+// Vendored tsconfig JSON schema (json.schemastore.org/tsconfig) so the JSON LSP
+// validates tsconfig.json without a network fetch (works offline / GitHub Pages).
+import tsconfigSchema from './vendor/tsconfig.schema.json';
+
+type MonacoNS = Awaited<ReturnType<typeof init>>;
 import { BrowserVite } from './browser-vite-wrapper';
 import { createViteHmrIframeHtml, type HotPayload } from './hmr-bridge';
 import { readVirtualFile } from 'browser-vite';
 import { installDependencies } from './installer';
 import { bundleDeps, defaultEntrySpecifiers } from './dep-bundler';
 import { depCacheKey, loadDepCache, saveDepCache } from './dep-cache';
+import {
+  buildTypesImportMap,
+  buildTypesImportMapFromPackageJson,
+  warmTypesCache,
+} from './ts-import-map';
 // es-module-lexer@2.3.1 ESM source (incl. base64 WASM) served to the iframe so
 // it can tokenize import specifiers with exact indices instead of regex.
 import esModuleLexerSrc from './vendor/es-module-lexer.js?raw';
@@ -37,14 +73,36 @@ import {
 // Virtual File System
 // =============================================================================
 
-interface VirtualFile {
-  path: string;
-  content: string;
-  type: 'tsx' | 'ts' | 'css' | 'json' | 'html';
-}
-
 // Initial file system with a multi-file React app
 const initialFiles: VirtualFile[] = [
+  {
+    path: '/tsconfig.json',
+    type: 'json',
+    content: JSON.stringify(
+      {
+        compilerOptions: {
+          target: 'ESNext',
+          lib: ['ESNext', 'DOM', 'DOM.Iterable'],
+          module: 'ESNext',
+          moduleResolution: 'Bundler',
+          jsx: 'react-jsx',
+          allowJs: true,
+          allowImportingTsExtensions: true,
+          noEmit: true,
+          // Lenient like a playground: don't flag implicit-any from untyped
+          // local modules (TS7016) — the editor should resolve, not nag.
+          strict: false,
+          noImplicitAny: false,
+          skipLibCheck: true,
+          esModuleInterop: true,
+          resolveJsonModule: true,
+          isolatedModules: true,
+        },
+      },
+      null,
+      2,
+    ),
+  },
   {
     path: '/index.html',
     type: 'html',
@@ -68,7 +126,7 @@ const initialFiles: VirtualFile[] = [
     content: `// Entry module — renders the app into #root (real Vite scaffold shape).
 import React from 'react';
 import { createRoot } from 'react-dom/client';
-import App from './App';
+import App from './App.tsx';
 
 createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
@@ -82,9 +140,9 @@ createRoot(document.getElementById('root')!).render(
     type: 'tsx',
     content: `// Main App Component
 import React from 'react';
-import { Counter } from './Counter';
-import { Header } from './components/Header';
-import { greeting } from './utils';
+import { Counter } from './Counter.tsx';
+import { Header } from './components/Header.tsx';
+import { greeting } from './utils.ts';
 
 export default function App() {
   return (
@@ -110,7 +168,7 @@ export default function App() {
     content: `// Counter Component
 import React, { useState } from 'react';
 import { Plus, Minus, RotateCcw } from 'lucide-react';
-import { Button } from './components/Button';
+import { Button } from './components/Button.tsx';
 
 interface CounterProps {
   initialCount: number;
@@ -281,48 +339,43 @@ button:active {
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "lucide-react": "^1.27.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19",
+    "@types/react-dom": "^19"
   }
 }
 `,
   },
 ];
 
-// Virtual file system state
-let fileSystem: Map<string, VirtualFile> = new Map();
-let currentFile: string = '/index.html';
-let modifiedFiles: Set<string> = new Set();
-
 // Initialize file system
 function initFileSystem() {
-  fileSystem.clear();
-  modifiedFiles.clear();
-  for (const file of initialFiles) {
-    fileSystem.set(file.path, { ...file });
-  }
+  editorStore.getState().setFiles(initialFiles);
 }
+
+// Convenience accessors over the store (imperative HMR paths).
+const fs = () => editorStore.getState().fileSystem;
+const getFile = (path: string) => fs()[path];
+const currentFile = () => editorStore.getState().currentFile;
 
 // =============================================================================
 // UI Elements
 // =============================================================================
 
-const statusEl = document.getElementById('status')!;
-const editorContainer = document.getElementById('editor')!;
-const previewFrame = document.getElementById('preview') as HTMLIFrameElement;
-const installConsoleEl = document.getElementById('installConsole')!;
-const runBtn = document.getElementById('runCode') as HTMLButtonElement;
-const installBtn = document.getElementById('installDeps') as HTMLButtonElement;
-const depsStatusEl = document.getElementById('depsStatus')!;
-const autoRunCheckbox = document.getElementById('autoRun') as HTMLInputElement;
-const fileTreeEl = document.getElementById('fileTree')!;
-const currentFileNameEl = document.getElementById('currentFileName')!;
-const newFileBtn = document.getElementById('newFileBtn')!;
-const newFileModal = document.getElementById('newFileModal')!;
-const newFileNameInput = document.getElementById('newFileName') as HTMLInputElement;
-const createNewFileBtn = document.getElementById('createNewFile')!;
-const cancelNewFileBtn = document.getElementById('cancelNewFile')!;
+// DOM hosts are rendered by the React shell's dock panels and exposed through
+// shellRefs. The Preview/DevTools panels mount ASYNCHRONOUSLY (dockview
+// renders their content after addPanel), so engine code paths that touch them
+// must first `await previewMounted.promise` / `devtoolsMounted.promise`.
+const previewFrame = () => shellRefs.previewFrame!;
+const installConsoleEl = () => shellRefs.installConsole!;
+const autoRunCheckbox = () => shellRefs.autoRunCheckbox!;
+const devtoolsFrame = () => shellRefs.devtoolsFrame;
 
 let browserVite: BrowserVite | null = null;
-let editor: EditorView | null = null;
+let monaco: MonacoNS | null = null;
+type IEditor = ReturnType<MonacoNS['editor']['create']>;
+let workspace: Workspace | null = null;
 let debounceTimer: number | null = null;
 let updateCounter = 0;
 let iframeReady = false;
@@ -337,13 +390,7 @@ function log(message: string, type: 'info' | 'success' | 'error' | 'warn' | 'hmr
 }
 
 function setStatus(message: string, type: 'success' | 'error' | 'pending') {
-  statusEl.textContent = message;
-  const statusStyles: Record<string, string> = {
-    success: 'bg-emerald-900/50 border-emerald-700',
-    error: 'bg-red-900/50 border-red-700',
-    pending: 'bg-amber-900/50 border-amber-700',
-  };
-  statusEl.className = `px-3 py-1.5 rounded font-mono text-xs border ${statusStyles[type]}`;
+  setStatusBar({ status: message, statusType: type });
 }
 
 // =============================================================================
@@ -360,14 +407,15 @@ const installConsoleStyles: Record<string, string> = {
 
 /** Show the console overlay in the preview pane, optionally clearing it. */
 function showInstallConsole(clear = true) {
-  if (clear) installConsoleEl.innerHTML = '';
+  const el = installConsoleEl();
+  if (clear) el.innerHTML = '';
   installProgressLine = null;
-  installConsoleEl.classList.remove('hidden');
+  el.classList.remove('hidden');
 }
 
 /** Hide the console overlay, revealing the preview iframe again. */
 function hideInstallConsole() {
-  installConsoleEl.classList.add('hidden');
+  installConsoleEl().classList.add('hidden');
 }
 
 /** Append a line to the install console (ANSI-style colored, autoscrolls). */
@@ -375,18 +423,19 @@ function installLog(message: string, kind: keyof typeof installConsoleStyles = '
   flushInstallProgress();
   // Finalize any in-place progress line: overwrite it with the completed
   // message instead of appending a new line (progress → result on one line).
+  const el = installConsoleEl();
   if (installProgressLine) {
     installProgressLine.className = installConsoleStyles[kind];
     installProgressLine.textContent = message;
     installProgressLine = null;
-    installConsoleEl.scrollTop = installConsoleEl.scrollHeight;
+    el.scrollTop = el.scrollHeight;
     return;
   }
   const line = document.createElement('div');
   line.className = installConsoleStyles[kind];
   line.textContent = message;
-  installConsoleEl.appendChild(line);
-  installConsoleEl.scrollTop = installConsoleEl.scrollHeight;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
 }
 
 let installProgressLine: HTMLDivElement | null = null;
@@ -406,13 +455,14 @@ function installProgress(message: string) {
     if (pendingProgress === null) return;
     const text = pendingProgress;
     pendingProgress = null;
+    const el = installConsoleEl();
     if (!installProgressLine) {
       installProgressLine = document.createElement('div');
       installProgressLine.className = installConsoleStyles.dim;
-      installConsoleEl.appendChild(installProgressLine);
+      el.appendChild(installProgressLine);
     }
     installProgressLine.textContent = text;
-    installConsoleEl.scrollTop = installConsoleEl.scrollHeight;
+    el.scrollTop = el.scrollHeight;
   });
 }
 
@@ -426,111 +476,18 @@ function flushInstallProgress() {
 }
 
 // =============================================================================
-// File Tree
+// File Explorer (@pierre/trees, React) — see Explorer.tsx
 // =============================================================================
 
-interface FileTreeNode {
-  name: string;
-  path: string;
-  isFolder: boolean;
-  children?: FileTreeNode[];
+function updateCurrentFileName(path: string | null) {
+  // The shell renders the current file itself from the store; mirror it into
+  // status-bar state for any consumers that read it from the bridge.
+  setStatusBar({ currentFile: path });
 }
 
-function buildFileTree(): FileTreeNode[] {
-  const root: FileTreeNode[] = [];
-  const paths = Array.from(fileSystem.keys()).sort();
-
-  for (const path of paths) {
-    const parts = path.split('/').filter(Boolean);
-    let current = root;
-
-    for (let i = 0; i < parts.length; i++) {
-      const part = parts[i];
-      const isFile = i === parts.length - 1;
-      const currentPath = '/' + parts.slice(0, i + 1).join('/');
-
-      let node = current.find((n) => n.name === part);
-
-      if (!node) {
-        node = {
-          name: part,
-          path: currentPath,
-          isFolder: !isFile,
-          children: isFile ? undefined : [],
-        };
-        current.push(node);
-      }
-
-      if (!isFile && node.children) {
-        current = node.children;
-      }
-    }
-  }
-
-  return root;
-}
-
-function getFileIcon(filename: string): string {
-  if (filename.endsWith('.tsx')) return '⚛️';
-  if (filename.endsWith('.ts')) return '📘';
-  if (filename.endsWith('.css')) return '🎨';
-  if (filename.endsWith('.json')) return '📋';
-  if (filename.endsWith('.html')) return '🌐';
-  return '📄';
-}
-
-function renderFileTree() {
-  const tree = buildFileTree();
-  fileTreeEl.innerHTML = '';
-
-  function renderNode(node: FileTreeNode, container: HTMLElement) {
-    if (node.isFolder) {
-      const folderEl = document.createElement('div');
-      folderEl.className = 'flex items-center px-3 py-1.5 cursor-pointer text-[13px] text-[hsl(var(--muted-foreground))] font-medium hover:bg-[hsl(var(--sidebar-accent))]';
-      folderEl.innerHTML = `<span class="mr-2">📁</span>${node.name}`;
-      container.appendChild(folderEl);
-
-      const contentsEl = document.createElement('div');
-      contentsEl.className = 'pl-3';
-      container.appendChild(contentsEl);
-
-      if (node.children) {
-        // Sort: folders first, then files
-        const sorted = [...node.children].sort((a, b) => {
-          if (a.isFolder && !b.isFolder) return -1;
-          if (!a.isFolder && b.isFolder) return 1;
-          return a.name.localeCompare(b.name);
-        });
-        for (const child of sorted) {
-          renderNode(child, contentsEl);
-        }
-      }
-    } else {
-      const fileEl = document.createElement('div');
-      const isActive = node.path === currentFile;
-      const isModified = modifiedFiles.has(node.path);
-      const baseClasses = 'flex items-center px-3 py-1.5 cursor-pointer text-[13px] border-l-2 hover:bg-[hsl(var(--sidebar-accent))] hover:text-[hsl(var(--foreground))]';
-      const activeClasses = isActive
-        ? 'bg-[hsl(var(--sidebar-accent))] text-[hsl(var(--foreground))] border-l-[hsl(var(--primary))]'
-        : 'text-[hsl(var(--sidebar-foreground))] border-l-transparent';
-      fileEl.className = `${baseClasses} ${activeClasses}`;
-      fileEl.innerHTML = `<span class="w-4 h-4 mr-2 text-sm">${getFileIcon(node.name)}</span>${node.name}${isModified ? '<span class="w-1.5 h-1.5 bg-amber-500 rounded-full ml-auto"></span>' : ''}`;
-      fileEl.addEventListener('click', () => openFile(node.path));
-      container.appendChild(fileEl);
-    }
-  }
-
-  // Root level: files first (index.html, package.json), then folders (src/) —
-  // real Vite projects keep these at the project root, shown above src/.
-  const sortedRoot = [...tree].sort((a, b) => {
-    if (!a.isFolder && b.isFolder) return -1;
-    if (a.isFolder && !b.isFolder) return 1;
-    return a.name.localeCompare(b.name);
-  });
-  for (const node of sortedRoot) {
-    renderNode(node, fileTreeEl);
-  }
-}
+useEditorStore.subscribe((state, prev) => {
+  if (state.currentFile !== prev.currentFile) updateCurrentFileName(state.currentFile);
+});
 
 // =============================================================================
 // Editor
@@ -545,65 +502,204 @@ function getFileType(path: string): 'tsx' | 'ts' | 'css' | 'json' | 'html' {
   return 'ts';
 }
 
-function openFile(path: string) {
-  // Save current editor content before switching
-  if (editor && currentFile) {
-    const content = editor.state.doc.toString();
-    const file = fileSystem.get(currentFile);
-    if (file && file.content !== content) {
-      file.content = content;
-      modifiedFiles.add(currentFile);
+/** Map a file path to a Monaco language id (Shiki grammar names). */
+function getMonacoLanguage(path: string): string {
+  const ext = path.split('.').pop()?.toLowerCase() ?? '';
+  switch (ext) {
+    case 'tsx': return 'tsx';
+    case 'ts': return 'typescript';
+    case 'jsx': return 'jsx';
+    case 'js':
+    case 'mjs':
+    case 'cjs': return 'javascript';
+    case 'css': return 'css';
+    case 'html': return 'html';
+    case 'json': return 'json';
+    case 'md': return 'markdown';
+    default: return 'plaintext';
+  }
+}
+
+// =============================================================================
+// Editors — ONE PER OPEN FILE (dockable).
+//
+// Every open file gets its own Monaco editor instance, created into the
+// dockview panel's DOM host (`data-file-path`). All editors for a file share
+// the file's single Monaco model, so undo stack, cursor, and scroll are
+// preserved per file, and the TS worker keeps one document per file.
+//
+// modern-monaco never attaches models on its own: its TS worker resolves
+// imports and calls `openModel(uri)`, which routes through
+// `workspace._openTextDocument`. Our override (in initialize) creates +
+// registers the dependency model but NEVER attaches it to any editor, so
+// background resolution can't hijack a visible editor.
+// =============================================================================
+
+// Models we've wired to the store (content → VFS sync). WeakSet so re-opening
+// never stacks duplicate listeners, and disposed models are GC'd freely.
+const wiredModels = new WeakSet<object>();
+
+type MonacoModel = ReturnType<MonacoNS['editor']['createModel']>;
+
+/** Live editors, keyed by the file path their panel shows. */
+const editorsByPath = new Map<string, IEditor>();
+
+/** Wire a model's edits back into the VFS store + schedule HMR. Idempotent. */
+function wireModelContentSync(model: MonacoModel) {
+  if (wiredModels.has(model)) return;
+  wiredModels.add(model);
+  // Read the path from the model's OWN uri — not a captured variable — so a
+  // model can never write its content to the wrong file.
+  model.onDidChangeContent(() => {
+    const p = model.uri.path;
+    editorStore.getState().setFileContent(p, model.getValue());
+    editorStore.getState().markModified(p);
+    scheduleUpdate();
+  });
+}
+
+/** Get (or create) the model for a VFS path with the correct language. */
+function getOrCreateModel(path: string, content: string) {
+  const m = monaco!;
+  const uri = m.Uri.file(path);
+  const lang = getMonacoLanguage(path);
+  let model = m.editor.getModel(uri);
+  if (!model) {
+    model = m.editor.createModel(content, lang, uri);
+  } else if (model.getLanguageId() !== lang) {
+    m.editor.setModelLanguage(model, lang);
+  }
+  return model;
+}
+
+const EDITOR_OPTIONS = {
+  theme: 'dark-plus',
+  automaticLayout: true,
+  fontSize: 13,
+  minimap: { enabled: false },
+  padding: { top: 8, bottom: 8 },
+  scrollBeyondLastLine: false,
+  tabSize: 2,
+  // Render hover/suggest/parameter-hint popovers in a position:fixed layer
+  // appended to <body> instead of inside the editor's overflow container, so
+  // they aren't clipped by the `overflow-hidden` editor/flex ancestors.
+  fixedOverflowWidgets: true,
+} as const;
+
+/** Find the dockview panel host for a file (rendered by the shell). With
+ *  renderer="always" each file has exactly one live host; pick the connected
+ *  one defensively in case of a transient duplicate during grid teardown. */
+function fileHost(path: string): HTMLElement | null {
+  const hosts = document.querySelectorAll<HTMLElement>(`.editor-host[data-file-path="${path}"]`);
+  for (const h of hosts) if (h.isConnected) return h;
+  return hosts[0] ?? null;
+}
+
+/** Create (or return) the Monaco editor for a file's dock panel. */
+function ensureEditor(path: string): IEditor | null {
+  if (!monaco) return null;
+  const existing = editorsByPath.get(path);
+  if (existing) return existing;
+  const host = fileHost(path);
+  const file = getFile(path);
+  if (!host || !file) return null;
+  const model = getOrCreateModel(path, file.content);
+  const ed = monaco.editor.create(host, { ...EDITOR_OPTIONS });
+  ed.setModel(model);
+  wireModelContentSync(model);
+  editorsByPath.set(path, ed);
+  return ed;
+}
+
+/** Dispose a file's editor (panel closed / file deleted). The model survives
+ *  so undo state is kept if the file re-opens. */
+function disposeEditor(path: string) {
+  const ed = editorsByPath.get(path);
+  if (ed) {
+    editorsByPath.delete(path);
+    ed.dispose();
+  }
+}
+
+/** Rename/move every editor under a path (file or directory subtree). Each is
+ *  disposed; the store's openFiles sync re-creates it under the new path. */
+function renameEditors(from: string, _to: string) {
+  for (const [path, ed] of [...editorsByPath]) {
+    if (path === from || path.startsWith(from + '/')) {
+      editorsByPath.delete(path);
+      ed.dispose();
     }
   }
+}
 
-  currentFile = path;
-  currentFileNameEl.textContent = path.split('/').pop() || '';
-
-  const file = fileSystem.get(path);
+/** Open a VFS file: store-driven. The shell adds the dock panel; our observer
+ *  (below) creates the editor into it. */
+function openFile(path: string) {
+  const file = getFile(path);
   if (!file) {
     log(`File not found: ${path}`, 'error');
     return;
   }
-
-  const fileType = getFileType(path);
-
-  if (editor) {
-    editor.destroy();
+  if (!monaco) {
+    log(`Editor not ready — cannot open ${path}`, 'warn');
+    return;
   }
-
-  const languageExtension =
-    fileType === 'css'
-      ? css()
-      : fileType === 'html'
-        ? html()
-        : javascript({ jsx: fileType === 'tsx', typescript: true });
-
-  editor = new EditorView({
-    state: EditorState.create({
-      doc: file.content,
-      extensions: [
-        basicSetup,
-        languageExtension,
-        oneDark,
-        EditorView.updateListener.of((update) => {
-          if (update.docChanged) {
-            modifiedFiles.add(currentFile);
-            renderFileTree();
-            scheduleUpdate();
-          }
-        }),
-        EditorView.theme({
-          '&': { height: '100%' },
-          '.cm-scroller': { overflow: 'auto' },
-        }),
-      ],
-    }),
-    parent: editorContainer,
-  });
-
-  renderFileTree();
+  editorStore.getState().openTab(path);
+  editorStore.getState().setSelectedItems([path]);
   log(`Opened file: ${path}`, 'info');
 }
+
+/**
+ * Lazily attach Monaco to the *visible* file tab only. Inactive restored tabs
+ * keep their dock panel/host but stay unhydrated until activated — hosts for
+ * hidden panels often aren't in the DOM yet, so creating into them fails.
+ */
+function hydrateVisibleEditor(path: string | null | undefined) {
+  if (!monaco || !path || path === 'preview') return;
+  let tries = 0;
+  const tryCreate = () => {
+    if (editorsByPath.has(path)) return;
+    if (getFile(path) && fileHost(path)) {
+      ensureEditor(path);
+      return;
+    }
+    if (++tries < 40) setTimeout(tryCreate, 25);
+  };
+  tryCreate();
+}
+
+// Store → editor lifecycle. Only the active file tab is hydrated; closed tabs
+// dispose their editor. Panel hosts mount asynchronously relative to the store
+// write, so hydrateVisibleEditor retries briefly.
+useEditorStore.subscribe((state, prev) => {
+  if (!monaco) return;
+  for (const path of prev.openFiles) {
+    if (!state.openFiles.includes(path)) disposeEditor(path);
+  }
+  if (
+    state.activeTab !== prev.activeTab
+    || (typeof state.activeTab === 'string'
+      && state.activeTab !== 'preview'
+      && !editorsByPath.has(state.activeTab))
+  ) {
+    hydrateVisibleEditor(state.activeTab);
+  }
+});
+
+// Shell-driven dock closes (× on a dock tab) → dispose the editor.
+useEditorStore.subscribe((state, prev) => {
+  if (state.editorCloseRequest && state.editorCloseRequest !== prev.editorCloseRequest) {
+    disposeEditor(state.editorCloseRequest.path);
+  }
+});
+
+// Renames: dispose editors under the old subtree; re-created on next open.
+useEditorStore.subscribe((state, prev) => {
+  if (state.fileSystem === prev.fileSystem) return;
+  for (const path of [...editorsByPath.keys()]) {
+    if (!state.fileSystem[path]) disposeEditor(path);
+  }
+});
 
 // =============================================================================
 // Module serving (real ESM via BrowserServer; no regex bundling / eval)
@@ -619,7 +715,7 @@ async function prepareModules(entry: string): Promise<string> {
   await syncFilesToBrowserVite();
   // Warm the graph so import-analysis has rewritten every import specifier to
   // a servable URL before the iframe starts importing.
-  await browserVite.transform(fileSystem.get(entry)?.content ?? '', entry);
+  await browserVite.transform(getFile(entry)?.content ?? '', entry);
   return entry;
 }
 
@@ -647,7 +743,7 @@ ${iframeRuntimeJs}
   `;
 
   const indexHtml =
-    fileSystem.get('/index.html')?.content ??
+    getFile('/index.html')?.content ??
     '<!doctype html><html><head><meta charset="UTF-8"></head><body><div id="root"></div></body></html>';
   return createViteHmrIframeHtml(indexHtml, clientBootstrap);
 }
@@ -659,18 +755,18 @@ ${iframeRuntimeJs}
 /** Sync VFS → browserVite and ensure graph entries exist for all files. */
 async function syncFilesToBrowserVite() {
   if (!browserVite) return;
-  for (const [path, file] of fileSystem) {
-    browserVite.setFile(path, file.content);
+  for (const file of Object.values(fs())) {
+    browserVite.setFile(file.path, file.content);
   }
   // Transform entry + deps so ModuleGraph edges / accept boundaries exist.
   // Tolerate per-file transform errors: BrowserServer already broadcasts an
   // `error` HotPayload for a failed transform, and a file currently in an
   // error state must not abort the whole sync (that would prevent recovery
   // when the file is later fixed).
-  for (const [path, file] of fileSystem) {
+  for (const file of Object.values(fs())) {
     if (file.type === 'css' || file.type === 'ts' || file.type === 'tsx') {
       try {
-        await browserVite.transform(file.content, path);
+        await browserVite.transform(file.content, file.path);
       } catch {
         // error payload already sent by the server; continue syncing others
       }
@@ -684,7 +780,7 @@ async function syncFilesToBrowserVite() {
  * /src/main.tsx when absent. Parsed via DOMParser (no regex on HTML).
  */
 function getEntryFromIndexHtml(): string {
-  const html = fileSystem.get('/index.html')?.content;
+  const html = getFile('/index.html')?.content;
   if (html) {
     const doc = new DOMParser().parseFromString(html, 'text/html');
     const src = doc.querySelector('script[type="module"]')?.getAttribute('src');
@@ -699,7 +795,7 @@ async function bootstrapPreview() {
   if (!browserVite || !iframeReady) return;
   const entryPath = getEntryFromIndexHtml();
   const entry = await prepareModules(entryPath);
-  previewFrame.contentWindow?.postMessage(
+  previewFrame().contentWindow?.postMessage(
     { type: 'hmr-update', entry, fileType: getFileType(entry) },
     '*',
   );
@@ -710,23 +806,22 @@ async function bootstrapPreview() {
  * Full-fidelity HMR path: Vite updateModules / propagateUpdate → HotPayload.
  */
 async function updatePreview() {
-  if (!browserVite || !editor) {
-    log('Cannot update: browserVite or editor not ready', 'warn');
+  if (!browserVite) {
+    log('Cannot update: browserVite not ready', 'warn');
     return;
   }
 
-  if (currentFile) {
-    const content = editor.state.doc.toString();
-    const file = fileSystem.get(currentFile);
-    if (file) {
-      file.content = content;
-    }
-    browserVite.setFile(currentFile, content);
+  const cur = currentFile();
+  const curEditor = cur ? editorsByPath.get(cur) : undefined;
+  if (cur && curEditor) {
+    const content = curEditor.getValue();
+    editorStore.getState().setFileContent(cur, content);
+    browserVite.setFile(cur, content);
   }
 
   // Non-code files (package.json etc.) aren't modules — skip the HMR pipeline.
   // Dependency changes take effect via the Install button, which rebundles.
-  const currentType = getFileType(currentFile);
+  const currentType = getFileType(cur ?? '');
   if (currentType === 'json') {
     log('package.json changed — click Install to apply dependency changes', 'warn');
     return;
@@ -736,13 +831,16 @@ async function updatePreview() {
   // it by rebuilding the iframe document from the LATEST VFS index.html (the
   // analogue of the dev server re-serving the page) and re-bootstrapping.
   if (currentType === 'html') {
+    // Import-map-only edits are editor/TS concerns (stripped from the preview
+    // document). A real markup change still needs a full iframe rebuild.
     log('index.html changed — full reload (rebuild document + re-bootstrap)', 'hmr');
+    void initIframe();
     return;
   }
 
   updateCounter++;
   const updateId = updateCounter;
-  log(`Starting HMR update #${updateId} for ${currentFile}`, 'hmr');
+  log(`Starting HMR update #${updateId} for ${cur}`, 'hmr');
 
   try {
     if (!iframeReady) {
@@ -750,10 +848,10 @@ async function updatePreview() {
       return;
     }
 
-    const content = fileSystem.get(currentFile)?.content ?? '';
+    const content = getFile(cur!)?.content ?? '';
     // Ensure graph is warm, then run full Vite HMR pipeline
     await syncFilesToBrowserVite();
-    const ok = await browserVite.handleHMRUpdate(currentFile, content);
+    const ok = await browserVite.handleHMRUpdate(cur!, content);
     if (ok) {
       log(`handleHMRUpdate #${updateId} dispatched HotPayload(s)`, 'hmr');
     } else {
@@ -786,7 +884,7 @@ function sendCDPCommand(method: string, params: Record<string, any> = {}): Promi
     cdpCallbacks.set(id, resolve);
 
     const message = JSON.stringify({ id, method, params });
-    previewFrame.contentWindow?.postMessage({ type: 'cdp-command', message }, '*');
+    previewFrame().contentWindow?.postMessage({ type: 'cdp-command', message }, '*');
 
     // Timeout after 10 seconds
     setTimeout(() => {
@@ -856,14 +954,14 @@ window.addEventListener('message', async (event) => {
       const path = event.data.path as string;
       // Well-known public paths served from precompiled bundles, not the VFS.
       if (path === '/@react-refresh') {
-        previewFrame.contentWindow?.postMessage(
+        previewFrame().contentWindow?.postMessage(
           { type: 'hmr-module', id: event.data.id, code: reactRefreshJs },
           '*',
         );
         return;
       }
       if (path === '/@vite/client') {
-        previewFrame.contentWindow?.postMessage(
+        previewFrame().contentWindow?.postMessage(
           { type: 'hmr-module', id: event.data.id, code: iframeClientJs },
           '*',
         );
@@ -874,7 +972,7 @@ window.addEventListener('message', async (event) => {
         const vfsPath = `/node_modules/.deps/${path.slice('/@deps/'.length)}`;
         const code = readVirtualFile(vfsPath);
         if (code === undefined) throw new Error(`Optimized dep not found: ${path}`);
-        previewFrame.contentWindow?.postMessage(
+        previewFrame().contentWindow?.postMessage(
           { type: 'hmr-module', id: event.data.id, code },
           '*',
         );
@@ -885,23 +983,23 @@ window.addEventListener('message', async (event) => {
       if (event.data.css || path.endsWith('.css')) {
         // CSS dev module self-injects via updateStyle; send raw css for the
         // iframe's stylesheet swap as well.
-        previewFrame.contentWindow?.postMessage(
+        previewFrame().contentWindow?.postMessage(
           {
             type: 'hmr-module',
             id: event.data.id,
-            code: fileSystem.get(path)?.content ?? '',
+            code: getFile(path)?.content ?? '',
             css: true,
           },
           '*',
         );
       } else {
-        previewFrame.contentWindow?.postMessage(
+        previewFrame().contentWindow?.postMessage(
           { type: 'hmr-module', id: event.data.id, code: served.code },
           '*',
         );
       }
     } catch (err) {
-      previewFrame.contentWindow?.postMessage(
+      previewFrame().contentWindow?.postMessage(
         {
           type: 'hmr-module',
           id: event.data.id,
@@ -917,7 +1015,7 @@ window.addEventListener('message', async (event) => {
     // rebuilds the iframe document from the latest VFS index.html and
     // re-bootstraps the entry it declares.
     log('Full reload — rebuilding iframe from latest index.html', 'hmr');
-    initIframe();
+    void initIframe();
   } else if (event.data?.type === 'cdp-ready') {
     cdpReady = true;
     log('CDP (Chobitsu) ready - Click DevTools to open Chrome DevTools', 'success');
@@ -932,17 +1030,28 @@ window.addEventListener('vite-hmr-payload', ((event: CustomEvent<HotPayload>) =>
   log(`HotPayload → ${payload.type}`, 'hmr');
 }) as EventListener);
 
-function initIframe() {
+// The shell pushes preview open state; when the preview dock panel is
+// re-opened, its iframe is a fresh element — rebuild the HMR runtime into it.
+// (No setPreviewOpen here — the shell already set the bridge state; re-setting
+// it from inside the listener re-fires this same handler and overflows.)
+onPreviewOpen((open) => {
+  if (open && browserVite) void initIframe();
+});
+
+async function initIframe() {
+  // The preview iframe mounts asynchronously (dockview renders panel content
+  // after addPanel). Wait for it before touching `.src`.
+  await previewMounted.promise;
   log('Initializing iframe with HMR runtime...', 'hmr');
   iframeReady = false;
   const html = createHMRRuntime();
   const blob = new Blob([html], { type: 'text/html' });
-  previewFrame.src = URL.createObjectURL(blob);
-  browserVite?.setPreviewIframe(previewFrame);
+  previewFrame().src = URL.createObjectURL(blob);
+  browserVite?.setPreviewIframe(previewFrame());
 }
 
 function scheduleUpdate() {
-  if (!autoRunCheckbox.checked) return;
+  if (!autoRunCheckbox().checked) return;
 
   if (debounceTimer) {
     clearTimeout(debounceTimer);
@@ -951,52 +1060,6 @@ function scheduleUpdate() {
     updatePreview();
     debounceTimer = null;
   }, 500);
-}
-
-// New file modal handlers
-function showNewFileModal() {
-  newFileModal.classList.remove('hidden');
-  newFileModal.classList.add('flex');
-  newFileNameInput.value = '';
-  newFileNameInput.focus();
-}
-
-function hideNewFileModal() {
-  newFileModal.classList.add('hidden');
-  newFileModal.classList.remove('flex');
-}
-
-function createNewFile() {
-  let filename = newFileNameInput.value.trim();
-  if (!filename) return;
-
-  // Add extension if not present
-  if (!filename.match(/\.(tsx?|css|json)$/)) {
-    filename += '.tsx';
-  }
-
-  // Add /src/ prefix if not present
-  let path = filename.startsWith('/') ? filename : '/src/' + filename;
-
-  if (fileSystem.has(path)) {
-    log(`File already exists: ${path}`, 'error');
-    return;
-  }
-
-  const type = getFileType(path);
-  const content =
-    type === 'css'
-      ? `/* ${filename} */\n`
-      : type === 'tsx'
-        ? `import React from 'react';\n\nexport function ${filename.replace(/\\.tsx?$/, '')}() {\n  return <div>New Component</div>;\n}\n`
-        : `// ${filename}\n`;
-
-  fileSystem.set(path, { path, content, type });
-  log(`Created new file: ${path}`, 'success');
-
-  hideNewFileModal();
-  renderFileTree();
-  openFile(path);
 }
 
 // =============================================================================
@@ -1010,12 +1073,13 @@ let installing = false;
 async function runInstall(): Promise<boolean> {
   if (!browserVite || installing) return depsInstalled;
   installing = true;
-  installBtn.disabled = true;
-  depsStatusEl.textContent = 'installing…';
+  setStatusBar({ deps: 'installing…' });
+  // Wait for the preview panel's install-console host (async dockview mount).
+  await previewMounted.promise;
   showInstallConsole(true);
   installLog('$ browser-vite install', 'dim');
   try {
-    const pkgJson = fileSystem.get('/package.json')?.content;
+    const pkgJson = getFile('/package.json')?.content;
     if (!pkgJson) throw new Error('No /package.json in the project');
     const { installed, direct } = await installDependencies(
       pkgJson,
@@ -1044,28 +1108,83 @@ async function runInstall(): Promise<boolean> {
         (m) => installProgress(m),
       );
       manifest = bundled.manifest;
-      void saveDepCache(cacheKey, bundled.manifest, bundled.files);
+      // Record the resolved versions in the cache's version index so future
+      // resolutions can offer them to semver as candidates.
+      void saveDepCache(cacheKey, bundled.manifest, bundled.files, installed);
     }
     browserVite.setOptimizedDeps(manifest);
     browserVite.clearModuleGraph();
     depsInstalled = true;
-    depsStatusEl.textContent = `${installed.length} deps`;
+    setStatusBar({ deps: `${installed.length} deps` });
     installLog(`✓ installed ${installed.length} package(s), ${specifiers.length} optimized entrie(s)`, 'success');
     log(`[install] Done — ${installed.length} package(s), ${specifiers.length} optimized entrie(s)`, 'success');
     // Brief pause so the success line is visible before the preview takes over.
     await new Promise((r) => setTimeout(r, 400));
     hideInstallConsole();
+    // Type-map sync + diagnostic refresh can pull large CDN `.d.ts` (and with
+    // real DOM libs loaded, rebuild the TS program). Never block Install/Ready
+    // on that — IntelliSense catches up in the background.
+    void syncTypesImportMap(installed);
     return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    depsStatusEl.textContent = 'install failed';
+    setStatusBar({ deps: 'install failed' });
     installLog(`✗ install failed: ${message}`, 'error');
     installLog('Fix /package.json and click Install to retry.', 'warn');
     log(`[install] Failed: ${message}`, 'error');
+    // Always reveal the preview again — a stuck install console covers the
+    // iframe and hides the HMR error overlay.
+    hideInstallConsole();
     return false;
   } finally {
     installing = false;
-    installBtn.disabled = false;
+  }
+}
+
+/** Last import-map JSON pushed to the worker — skip no-op updates. */
+let lastTypesImportMapJson = '';
+
+/**
+ * Push an esm.sh types import map into the TS worker — host-owned, never
+ * written into the user's project files (IDEs don't require manual import maps).
+ * Safe to call without awaiting; must not gate Install/Ready.
+ */
+async function syncTypesImportMap(installed: Array<{ name: string; version: string }>) {
+  const importMap = buildTypesImportMap(installed);
+  const json = JSON.stringify(importMap.imports);
+  const names = Object.keys(importMap.imports).filter((k) => !k.endsWith('/'));
+  // Always warm the monaco HTTP cache for the pinned URLs (idempotent). This is
+  // what makes the worker's first resolve a cache hit instead of a cold CDN
+  // waterfall — do it even when the import map JSON is unchanged.
+  const warm = warmTypesCache(importMap).then((r) => {
+    log(`[types] warmed ${r.warmed} decl(s)${r.failed ? `, ${r.failed} failed` : ''}`, 'dim');
+  });
+  if (json === lastTypesImportMapJson) {
+    await warm;
+    return;
+  }
+  try {
+    const worker = (globalThis as { __monacoLanguageWorker?: { getProxy: () => Promise<{
+      updateCompilerOptions: (o: { importMap: typeof importMap }) => Promise<void>;
+    }> } }).__monacoLanguageWorker;
+    if (!worker) {
+      await warm;
+      return;
+    }
+    // Overlap cache warm with the worker import-map update.
+    const proxyP = worker.getProxy().then((proxy) => proxy.updateCompilerOptions({ importMap }));
+    await Promise.all([proxyP, warm]);
+    lastTypesImportMapJson = json;
+    // Only nudge the visible buffer — refreshing every open model forces a
+    // program-wide re-resolve on the install critical path.
+    const active = useEditorStore.getState().activeTab;
+    if (active && active !== 'preview') {
+      const model = monaco?.editor.getModels().find((m) => m.uri.path === active);
+      Reflect.get(model, 'refreshDiagnostics')?.();
+    }
+    log(`[types] esm.sh decls synced → ${names.join(', ')}`, 'success');
+  } catch (err) {
+    log(`[types] failed to sync import map: ${err instanceof Error ? err.message : err}`, 'warn');
   }
 }
 
@@ -1078,32 +1197,172 @@ async function initialize() {
     log('Initializing browser-vite...');
     setStatus('Initializing...', 'pending');
 
-    // Initialize file system
+    // Initialize file system (subscription renders the tree)
     initFileSystem();
-    renderFileTree();
+
+    // Initialize Monaco (modern-monaco): pre-highlights with Shiki while the
+    // editor core loads in the background, then returns the monaco namespace.
+    // The fork's TS worker bundles its own TypeScript (self-contained, no CDN).
+    log('Loading Monaco editor...', 'info');
+
+    // Workspace backed by our VFS (customFS) so the TS language service can
+    // resolve cross-file imports (props/types from sibling modules). A
+    // tsconfig.json gives the worker real compiler options (JSX, resolution).
+    workspace = new Workspace({
+      name: 'browser-vite-example',
+      customFS: new VFSFileSystem(),
+    });
+
+    // SINGLE-OWNER GUARD. `_openTextDocument` is called by the TS worker's
+    // `openModel` host to materialize *dependency* models (e.g. opening
+    // main.tsx resolves ./App.tsx, ./Counter.tsx, …). modern-monaco's stock
+    // implementation ends with `editor.setModel(model)` — which rips the
+    // visible editor away from the file you clicked to the last-resolved
+    // dependency (the "wild blinking / wrong file" bug). We own the editor, so
+    // we replace it: still create + register the model (the worker needs the
+    // document for intellisense), but NEVER attach it to the editor. The only
+    // code path that changes the visible model is our `openFile`.
+    (workspace as unknown as {
+      _openTextDocument: (
+        m: MonacoNS,
+        ed: IEditor | null,
+        uri: string | URL,
+        sel?: unknown,
+        readonlyContent?: string,
+      ) => Promise<unknown>;
+    })._openTextDocument = async (m, _ed, uri, _sel, readonlyContent) => {
+      const fs = workspace!.fs;
+      const url = new URL(String(uri), 'file:///');
+      const href = url.href;
+      const content = readonlyContent ?? (await fs.readTextFile(href));
+      const modelUri = m.Uri.parse(href);
+      let model = m.editor.getModel(modelUri);
+      if (!model) model = m.editor.createModel(content, getMonacoLanguage(url.pathname), modelUri);
+      return model; // attach-free: background dependency resolution never grabs an editor
+    };
+
+    // Seed the types import map once; remember it so post-install sync is a
+    // no-op when resolved versions match the package.json pins (common case).
+    // Prefer `@types/*` `.d.ts` URLs (not JS modules) so the worker skips the
+    // x-typescript-types hop. Warm monaco's HTTP cache in parallel with init
+    // so the first diagnostic pass is usually a cache hit.
+    const seedTypesImportMap = buildTypesImportMapFromPackageJson(
+      getFile('/package.json')?.content ?? '{}',
+    );
+    lastTypesImportMapJson = JSON.stringify(seedTypesImportMap.imports);
+    const seedWarm = warmTypesCache(seedTypesImportMap).then((r) => {
+      log(`[types] seed cache: ${r.warmed} decl(s)`, 'dim');
+    });
+
+    monaco = await init({
+      defaultTheme: 'dark-plus', // VS Code Dark+ — closest to VS Dark
+      // Preload every grammar this project uses so each language's Shiki
+      // tokenizer is registered BEFORE any file opens. Otherwise modern-monaco
+      // lazily `await`s a CDN grammar fetch on a language's first open and the
+      // editor paints untokenized (blank) for a frame — the "blinking content".
+      langs: ['tsx', 'typescript', 'javascript', 'jsx', 'css', 'html', 'json', 'markdown'],
+      workspace,
+      lsp: {
+        typescript: {
+          // Host-owned esm.sh types (not written into user project files).
+          // Seeded from package.json ranges; Install replaces with exact pins
+          // via worker.updateCompilerOptions({ importMap }) only when they differ.
+          resolution: 'importmap',
+          importMap: seedTypesImportMap,
+          compilerOptions: {
+            jsx: 4 /* JsxEmit.ReactJSX */,
+            allowJs: true,
+            allowImportingTsExtensions: true,
+            noEmit: true,
+            esModuleInterop: true,
+            resolveJsonModule: true,
+            isolatedModules: true,
+          },
+        },
+        json: {
+          // Register the vendored tsconfig schema so validation/completion works
+          // without fetching json.schemastore.org (which fails in this sandbox).
+          schemas: [
+            {
+              uri: 'https://json.schemastore.org/tsconfig',
+              fileMatch: ['tsconfig.json', 'tsconfig.*.json'],
+              schema: tsconfigSchema as never,
+            },
+          ],
+        },
+      },
+    });
+
+    // Editors are created per open file (into each dockview panel's host) by
+    // the store subscriptions above. Content→VFS sync is wired per model in
+    // ensureEditor, so every visible buffer writes back regardless of which
+    // dock group it lives in.
 
     // Initialize browser-vite (Oxc WASM + full Vite 8 HMR)
     browserVite = new BrowserVite();
     await browserVite.init();
-    browserVite.setPreviewIframe(previewFrame);
+    browserVite.setPreviewIframe(previewFrame());
 
     // Seed VFS into browser-vite
-    for (const [path, file] of fileSystem) {
-      browserVite.setFile(path, file.content);
+    for (const file of Object.values(fs())) {
+      browserVite.setFile(file.path, file.content);
     }
 
-    // Enable UI
-    runBtn.disabled = false;
-    autoRunCheckbox.disabled = false;
-    installBtn.disabled = false;
-    installBtn.addEventListener('click', () => {
-      void runInstall().then((ok) => {
-        if (ok) initIframe();
-      });
+    // Mount the React Explorer into #fileTree and bind structural-ops hooks so
+    // rename/delete/move in the tree keep Monaco models + the module graph in
+    // sync with the VFS.
+    bindBrowserVite(browserVite);
+    bindMonacoHooks({
+      deleteModel: (path) => {
+        if (!monaco) return;
+        disposeEditor(path);
+        const uri = monaco.Uri.file(path);
+        monaco.editor.getModel(uri)?.dispose();
+      },
+      renameModel: (from, to) => {
+        if (!monaco) return;
+        renameEditors(from, to);
+        const model = monaco.editor.getModel(monaco.Uri.file(from));
+        // The new path's model is (re)created on next open with the right
+        // language; just drop the stale one keyed to the old URI.
+        model?.dispose();
+      },
+      openFile,
     });
 
-    // Open the project's real entry document
-    openFile('/index.html');
+    // The Explorer is rendered by the React shell; toolbar actions are bound
+    // through the bridge. Buttons enable when the engine is ready.
+    bindShellActions({
+      run: () => void runManual(),
+      install: () => {
+        void runInstall().then((ok) => {
+          if (ok) void initIframe();
+        });
+      },
+      toggleDevtools: () => toggleDevtools(),
+    });
+    autoRunCheckbox().disabled = false;
+    setShellReady(true);
+
+    // Let seed type fetches finish (or nearly) before attaching editors so the
+    // first IntelliSense pass doesn't wait on a cold CDN resolve.
+    await Promise.race([seedWarm, new Promise((r) => setTimeout(r, 1500))]);
+
+    // Hydrate whatever tab is already active (dock restore → store), or open
+    // the project entry when nothing was restored.
+    const restored = useEditorStore.getState();
+    if (restored.activeTab && restored.activeTab !== 'preview' && restored.openFiles.length > 0) {
+      // Re-apply after VFS seed so replaceOpenTabs can filter to real files,
+      // then attach Monaco into the visible panel host.
+      restored.replaceOpenTabs(restored.openFiles, restored.activeTab);
+      hydrateVisibleEditor(useEditorStore.getState().activeTab);
+      const active = useEditorStore.getState().activeTab;
+      if (active && active !== 'preview') {
+        useEditorStore.getState().setSelectedItems([active]);
+      }
+    } else {
+      openFile('/index.html');
+    }
 
     // Install dependencies (real npm registry -> VFS -> esbuild-wasm), then
     // bring up the preview once the optimized deps manifest is available.
@@ -1119,12 +1378,17 @@ async function initialize() {
     log('Browser-vite ready!', 'success');
 
     // Initialize iframe with Vite HotPayload HMR client
-    initIframe();
+    await initIframe();
 
     // Expose for debugging and external use
     (window as any).browserVite = browserVite;
-    (window as any).fileSystem = fileSystem;
-    (window as any).getEditor = () => editor;
+    (window as any).fileSystem = fs();
+    (window as any).store = useEditorStore;
+    (window as any).getEditor = (path?: string) =>
+      path ? editorsByPath.get(path) ?? null : editorsByPath.get(currentFile() ?? '') ?? null;
+    (window as any).editors = editorsByPath;
+    (window as any).monaco = monaco;
+    (window as any).workspace = workspace;
 
     // Expose CDP API
     (window as any).cdp = {
@@ -1138,17 +1402,18 @@ async function initialize() {
     const message = error instanceof Error ? error.message : String(error);
     setStatus(`Error: ${message}`, 'error');
     log(`Initialization failed: ${message}`, 'error');
+    console.error('[init] full stack:\n' + (error instanceof Error ? error.stack : String(error)));
   }
 }
 
 // =============================================================================
 // DevTools - Embedded Chrome DevTools Frontend via Chii
+//
+// The shell (App.tsx) owns the DevTools dock panel — it adds/removes the
+// dockview panel and pushes open state through `onDevtoolsOpen`. The engine
+// tracks that state, lazy-loads chii on first open, and owns the CDP message
+// forwarding.
 // =============================================================================
-
-const devtoolsToggle = document.getElementById('devtoolsToggle')!;
-const devtoolsPanel = document.getElementById('devtoolsPanel')!;
-const devtoolsFrame = document.getElementById('devtoolsFrame') as HTMLIFrameElement;
-const devtoolsResizeHandle = document.getElementById('devtoolsResizeHandle')!;
 
 let devtoolsOpen = false;
 let devtoolsInitialized = false;
@@ -1156,28 +1421,31 @@ let devtoolsInitialized = false;
 // Chii DevTools URL with embedded mode pointing to our origin
 const CHII_DEVTOOLS_URL = `https://chii.liriliri.io/front_end/chii_app.html#?embedded=${encodeURIComponent(window.location.origin)}`;
 
+onDevtoolsOpen((open) => {
+  devtoolsOpen = open;
+  if (open && !devtoolsInitialized && cdpReady) void initDevtoolsFrame();
+});
+
 function toggleDevtools() {
+  // The shell has already added/removed the dock panel and pushed the new open
+  // state through onDevtoolsOpen (handled above). Here we only lazy-load chii.
+  if (!devtoolsOpen) return;
   if (!cdpReady) {
-    log('Cannot open DevTools: CDP not ready', 'error');
+    log('DevTools unavailable: CDP not ready', 'warn');
     return;
   }
-
-  devtoolsOpen = !devtoolsOpen;
-  devtoolsPanel.classList.toggle('hidden', !devtoolsOpen);
-  devtoolsPanel.classList.toggle('block', devtoolsOpen);
-  devtoolsToggle.classList.toggle('bg-[hsl(var(--primary))]', devtoolsOpen);
-
-  if (devtoolsOpen && !devtoolsInitialized) {
-    initDevtoolsFrame();
-  }
-
-  log(devtoolsOpen ? 'DevTools panel opened' : 'DevTools panel closed', 'info');
+  if (!devtoolsInitialized) void initDevtoolsFrame();
 }
 
-function initDevtoolsFrame() {
+async function initDevtoolsFrame() {
   log('Initializing embedded DevTools...', 'info');
+  // The DevTools iframe mounts asynchronously (dockview panel content). Wait
+  // for it rather than assuming same-tick attachment.
+  await devtoolsMounted.promise;
+  const frame = devtoolsFrame();
+  if (!frame) return;
   // Load chii directly from its CDN - no intermediate iframe needed
-  devtoolsFrame.src = CHII_DEVTOOLS_URL;
+  frame.src = CHII_DEVTOOLS_URL;
   devtoolsInitialized = true;
 }
 
@@ -1192,7 +1460,7 @@ function handleDevtoolsMessage(event: MessageEvent) {
       const parsed = JSON.parse(event.data);
       if (parsed.method || parsed.id !== undefined) {
         // Forward CDP command to preview iframe (chobitsu)
-        previewFrame.contentWindow?.postMessage(
+        previewFrame().contentWindow?.postMessage(
           { type: 'cdp-command', message: event.data },
           '*'
         );
@@ -1205,71 +1473,53 @@ function handleDevtoolsMessage(event: MessageEvent) {
 
 // Forward CDP responses to chii DevTools iframe
 function forwardCDPToDevtools(message: string) {
-  if (devtoolsOpen && devtoolsInitialized && devtoolsFrame.contentWindow) {
-    devtoolsFrame.contentWindow.postMessage(message, 'https://chii.liriliri.io');
+  const frame = devtoolsFrame();
+  if (devtoolsOpen && devtoolsInitialized && frame?.contentWindow) {
+    frame.contentWindow.postMessage(message, 'https://chii.liriliri.io');
   }
 }
-
-// DevTools panel resize functionality
-let isResizing = false;
-let startY = 0;
-let startHeight = 0;
-
-devtoolsResizeHandle.addEventListener('mousedown', (e) => {
-  isResizing = true;
-  startY = e.clientY;
-  startHeight = devtoolsPanel.offsetHeight;
-  document.body.style.cursor = 'ns-resize';
-  document.body.style.userSelect = 'none';
-});
-
-document.addEventListener('mousemove', (e) => {
-  if (!isResizing) return;
-  const deltaY = startY - e.clientY;
-  const newHeight = Math.min(Math.max(150, startHeight + deltaY), window.innerHeight - 200);
-  devtoolsPanel.style.height = `${newHeight}px`;
-});
-
-document.addEventListener('mouseup', () => {
-  if (isResizing) {
-    isResizing = false;
-    document.body.style.cursor = '';
-    document.body.style.userSelect = '';
-  }
-});
 
 // Listen for messages from chii DevTools
 window.addEventListener('message', handleDevtoolsMessage);
 
-// DevTools toggle button
-devtoolsToggle.addEventListener('click', toggleDevtools);
+// =============================================================================
+// Manual Run
+// =============================================================================
 
-// Event listeners
-runBtn.addEventListener('click', async () => {
+async function runManual() {
   log('Manual run triggered', 'info');
   // Persist the current editor buffer, then do a clean re-bootstrap. A manual
   // Run is the user's explicit "render the current code now" — re-bootstrapping
   // guarantees recovery from any prior HMR error state (stale overlay, poisoned
   // module graph), where an incremental HMR update might silently no-op.
-  if (editor && currentFile) {
-    const file = fileSystem.get(currentFile);
-    if (file) file.content = editor.state.doc.toString();
-    browserVite?.setFile(currentFile, editor.state.doc.toString());
+  const cur = currentFile();
+  const curEditor = cur ? editorsByPath.get(cur) : undefined;
+  if (cur && curEditor) {
+    editorStore.getState().setFileContent(cur, curEditor.getValue());
+    browserVite?.setFile(cur, curEditor.getValue());
   }
   browserVite?.clearModuleGraph();
   await bootstrapPreview();
-});
+}
 
-newFileBtn.addEventListener('click', showNewFileModal);
-cancelNewFileBtn.addEventListener('click', hideNewFileModal);
-createNewFileBtn.addEventListener('click', createNewFile);
-newFileNameInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') createNewFile();
-  if (e.key === 'Escape') hideNewFileModal();
-});
-newFileModal.addEventListener('click', (e) => {
-  if (e.target === newFileModal) hideNewFileModal();
-});
+// =============================================================================
+// Bootstrap
+// =============================================================================
 
-// Start
-initialize();
+// Mount the React shell (toolbar + dockview panes). This renders synchronously,
+// filling shellRefs with the DOM hosts the engine attaches to, then the engine
+// initializes against those hosts.
+function mountShell() {
+  const container = document.getElementById('root')!;
+  createRoot(container).render(
+    <React.StrictMode>
+      <App />
+    </React.StrictMode>,
+  );
+}
+
+// Start. Mount the shell, then initialize the engine once the shell's DOM
+// hosts (editor/preview/etc.) are rendered — createRoot().render() is async,
+// so we gate on the shell's onReady signal rather than assuming same-tick refs.
+mountShell();
+void shellReady.then(() => initialize());

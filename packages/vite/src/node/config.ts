@@ -63,11 +63,20 @@ import type {
   ResolvedBuilderOptions,
 } from './build'
 import {
-  buildEnvironmentOptionsDefaults,
-  builderOptionsDefaults,
   resolveBuildEnvironmentOptions,
   resolveBuilderOptions,
 } from './build'
+// BROWSER VITE patch: config.ts ↔ build.ts is an ESM cycle (upstream Vite is
+// bundled, hiding it; the fork serves raw modules). Importing
+// buildEnvironmentOptionsDefaults / builderOptionsDefaults here hits a TDZ at
+// module scope because build.ts hasn't finished initializing. These are
+// BUILD-only defaults the dev fork never exercises, so inline the literals
+// (kept in sync with build.ts) instead of a cycle-breaking import.
+const buildEnvironmentOptionsDefaults: Readonly<
+  Partial<import('./build').BuildEnvironmentOptions>
+> = Object.freeze({ outDir: 'dist', target: 'baseline-widely-available' })
+const builderOptionsDefaults: Readonly<Partial<import('./build').BuilderOptions>> =
+  Object.freeze({})
 import type { ResolvedServerOptions, ServerOptions } from './server'
 import { resolveServerOptions, serverConfigDefaults } from './server'
 import { DevEnvironment } from './server/environment'
@@ -78,9 +87,15 @@ import { resolvePreviewOptions } from './preview'
 import {
   type CSSOptions,
   type ResolvedCSSOptions,
-  cssConfigDefaults,
   resolveCSSOptions,
 } from './plugins/css'
+// BROWSER VITE patch: same config.ts ↔ plugins/css.ts ESM cycle — inline the
+// css defaults literal (kept in sync with css.ts) to avoid the TDZ.
+const cssConfigDefaults: Readonly<Partial<CSSOptions>> = Object.freeze({
+  transformer: 'postcss',
+  preprocessorMaxWorkers: true,
+  devSourcemap: false,
+})
 import {
   arraify,
   asyncFlatten,

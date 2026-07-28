@@ -13,11 +13,14 @@
  * that changes the hash.
  */
 
-import { setVirtualFile, withVirtualFileBatch } from 'browser-vite';
+import { setVirtualFile, deleteVirtualFile, listVirtualFiles, withVirtualFileBatch } from 'browser-vite';
 
 const DB_NAME = 'browser-vite-deps';
 const STORE = 'deps';
 const CACHE_VERSION = 1;
+
+/** Synthetic key under which we persist the name -> cached-versions index. */
+const VERSION_INDEX_KEY = '__version-index__';
 
 export interface DepCacheEntry {
   /** Cache key (hash of resolved versions + cache format version). */
@@ -27,6 +30,9 @@ export interface DepCacheEntry {
   /** VFS path -> file contents for every /node_modules/.deps/* output. */
   files: Record<string, string>;
 }
+
+/** name -> sorted list of package versions present in cached bundles. */
+export type VersionIndex = Record<string, string[]>;
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -55,6 +61,31 @@ export async function depCacheKey(resolved: Array<{ name: string; version: strin
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+/** Read the name -> cached-versions index (empty on first run). */
+export async function getCachedVersionIndex(): Promise<VersionIndex> {
+  try {
+    const db = await openDb();
+    const entry = await new Promise<VersionIndex | null>((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readonly');
+      const req = tx.objectStore(STORE).get(VERSION_INDEX_KEY);
+      req.onsuccess = () => resolve((req.result as VersionIndex) ?? null);
+      req.onerror = () => reject(req.error);
+    });
+    db.close();
+    return entry ?? {};
+  } catch {
+    return {};
+  }
+}
+
+/** The cached versions available for a package (the list semver picks from).
+ *  Reads from a preloaded index snapshot when provided (avoids a DB round-trip
+ *  per package during install). */
+export async function getCachedVersions(name: string, index?: VersionIndex): Promise<string[]> {
+  const idx = index ?? (await getCachedVersionIndex());
+  return idx[name] ?? [];
+}
+
 /** Load a cached bundle for `key`, restoring its files into the VFS. */
 export async function loadDepCache(key: string): Promise<Record<string, string> | null> {
   try {
@@ -78,18 +109,49 @@ export async function loadDepCache(key: string): Promise<Record<string, string> 
   }
 }
 
-/** Persist a bundle's manifest + output files under `key`. */
+/** Delete every file under /node_modules/<name>/ — used to drop a stale
+ *  installed version before a different (resolver-picked) version is unpacked. */
+export function removeInstalledPackage(name: string): void {
+  const prefix = `/node_modules/${name}/`;
+  withVirtualFileBatch(() => {
+    for (const path of listVirtualFiles()) {
+      if (path.startsWith(prefix)) deleteVirtualFile(path);
+    }
+  });
+}
+
+/** Persist a bundle's manifest + output files under `key`, and record the
+ *  resolved versions in the name->versions index so future resolutions can
+ *  offer them to semver as candidates. */
 export async function saveDepCache(
   key: string,
   manifest: Record<string, string>,
   files: Record<string, string>,
+  resolved: Array<{ name: string; version: string }> = [],
 ): Promise<void> {
   try {
     const db = await openDb();
     const entry: DepCacheEntry = { key, manifest, files };
+
+    // Merge the newly-resolved versions into the cached-version index.
+    const index = await new Promise<VersionIndex>((resolve) => {
+      const tx = db.transaction(STORE, 'readonly');
+      const req = tx.objectStore(STORE).get(VERSION_INDEX_KEY);
+      req.onsuccess = () => resolve((req.result as VersionIndex) ?? {});
+      req.onerror = () => resolve({});
+    });
+    for (const { name, version } of resolved) {
+      const list = index[name] ?? (index[name] = []);
+      if (!list.includes(version)) {
+        list.push(version);
+        list.sort();
+      }
+    }
+
     await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(STORE, 'readwrite');
       tx.objectStore(STORE).put(entry, key);
+      tx.objectStore(STORE).put(index, VERSION_INDEX_KEY);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });

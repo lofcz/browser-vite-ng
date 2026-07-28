@@ -1,0 +1,370 @@
+/* VS Code Dark+ workbench styling. Colors match the official Dark+ palette. */
+
+:root {
+  --vscode-bg: #1e1e1e;
+  --vscode-fg: #cccccc;
+  --vscode-titlebar-bg: #3c3c3c;
+  --vscode-activitybar-bg: #333333;
+  --vscode-activitybar-fg: #858585;
+  --vscode-activitybar-active-fg: #ffffff;
+  --vscode-sidebar-bg: #252526;
+  --vscode-sidebar-header-fg: #bbbbbb;
+  --vscode-panel-bg: #1e1e1e;
+  --vscode-statusbar-bg: #181818; /* statusBar.noFolderBackground — neutral dark */
+  --vscode-statusbar-fg: rgba(255, 255, 255, 0.65); /* statusBar.foreground */
+  --vscode-border: #3c3c3c;
+  --vscode-accent: #007acc;
+}
+
+* { box-sizing: border-box; }
+
+/* ================= OverlayScrollbars — VS Code Dark+ scrollbar ============
+ * A thin strip that hugs the edge, appears on hover/scroll, and matches the
+ * workbench's scrollbarSlider colors exactly. Applied via `os-theme-vscode`.
+ * VS Code token reference:
+ *   scrollbarSlider.background       rgba(121,121,121,.4)
+ *   scrollbarSlider.hoverBackground  rgba(100,100,100,.7)
+ *   scrollbarSlider.activeBackground rgba(191,191,191,.4)
+ */
+.os-theme-vscode {
+  --os-size: 10px;              /* VS Code default vertical/horizontal size */
+  --os-padding-perpendicular: 0px;
+  --os-padding-axis: 0px;
+  --os-track-border-radius: 0px;
+  --os-handle-interactive-area-offset: 0px;
+  --os-handle-border-radius: 0px;
+  --os-handle-bg: rgba(121, 121, 121, 0.4);
+  --os-handle-bg-hover: rgba(100, 100, 100, 0.7);
+  --os-handle-bg-active: rgba(191, 191, 191, 0.4);
+  --os-track-bg: transparent;
+  --os-track-bg-hover: transparent;
+  --os-track-bg-active: transparent;
+  --os-handle-min-size: 20px;
+}
+
+/* OverlayScrollbars renders its scrollbar rails as absolutely-positioned
+ * children of the scroll host. Inside the tree that would steal the drag-line's
+ * containing block (it must stay the tree itself). Pin the rails to the
+ * viewport so they can never become the offset parent of tree content. */
+.vscode-tree .os-scrollbar { position: fixed; }
+
+/* ================= Dockview tab-strip scrollbar — match Monaco ============
+ * Source of truth: modern-monaco → monaco-editor-core
+ *   esm/vs/base/browser/ui/scrollbar/media/scrollbars.css
+ *   + miscColors.js scrollbarSlider.* tokens
+ *
+ * Monaco behavior we mirror:
+ *   - fade in:  opacity 100ms linear  (.visible)
+ *   - fade out: opacity 800ms linear  (.invisible.fade)
+ *   - colors:   scrollbarSlider.background / hover / active
+ *   - rounding: full pill (matches the rendered monaco thumb)
+ * Tab strip is only vertically smaller than the editor's 10px default.
+ */
+.editor-dock .dv-scrollable .dv-scrollbar {
+  border-radius: 999px;
+  background-color: rgba(121, 121, 121, 0.4); /* scrollbarSlider.background */
+  opacity: 0;
+  pointer-events: none;
+  will-change: opacity;
+  transform: none;
+  backface-visibility: visible;
+  transition: opacity 800ms linear;
+}
+.editor-dock .dv-scrollable .dv-scrollbar-horizontal {
+  height: 3px;
+  bottom: 0;
+  left: 0;
+}
+.editor-dock .dv-scrollable .dv-scrollbar-vertical {
+  width: 3px;
+  right: 0;
+  top: 0;
+}
+.editor-dock .dv-scrollable:hover .dv-scrollbar,
+.editor-dock .dv-scrollable.dv-scrollable-resizing .dv-scrollbar,
+.editor-dock .dv-scrollable.dv-scrollable-scrolling .dv-scrollbar {
+  opacity: 1;
+  pointer-events: auto;
+  background-color: rgba(121, 121, 121, 0.4);
+  transition: opacity 100ms linear;
+}
+.editor-dock .dv-scrollable .dv-scrollbar:hover {
+  background-color: rgba(100, 100, 100, 0.7); /* scrollbarSlider.hoverBackground */
+}
+.editor-dock .dv-scrollable .dv-scrollbar:active {
+  background-color: rgba(191, 191, 191, 0.4); /* scrollbarSlider.activeBackground */
+}
+
+.workbench {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100%;
+  background: var(--vscode-bg);
+  color: var(--vscode-fg);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 13px;
+  /* NOTE: no overflow:hidden here — Monaco renders hover/suggest popovers in a
+   * position:fixed layer (fixedOverflowWidgets), and clipping ancestors would
+   * cut them off. Flex layout already confines children to the viewport. */
+}
+
+.workbench-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+/* ---------------- Title Bar ---------------- */
+.titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 32px;
+  padding: 0 12px;
+  background: var(--vscode-titlebar-bg);
+  color: var(--vscode-fg);
+  border-bottom: 1px solid var(--vscode-border);
+  flex: none;
+  user-select: none;
+}
+.titlebar-app { font-weight: 600; font-size: 13px; letter-spacing: 0.2px; }
+.titlebar-right { display: flex; align-items: center; gap: 8px; }
+
+.status-pill {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: #444;
+  color: #ddd;
+}
+.status-success { background: #2ea043; color: #fff; }
+.status-error { background: #f85149; color: #fff; }
+.status-pending { background: #bb8009; color: #fff; }
+
+.tbtn {
+  background: #3c3c3c;
+  color: var(--vscode-fg);
+  border: 1px solid #555;
+  border-radius: 4px;
+  font-size: 12px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+.tbtn:hover:not(:disabled) { background: #4a4a4a; }
+.tbtn:disabled { opacity: 0.5; cursor: default; }
+.tbtn-active { background: var(--vscode-accent); border-color: var(--vscode-accent); color: #fff; }
+.tbtn-primary { background: var(--vscode-accent); border-color: var(--vscode-accent); color: #fff; }
+.tbtn-primary:hover:not(:disabled) { background: #1f8ad2; }
+.tbtn-autorun { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--vscode-fg); cursor: pointer; }
+
+/* ---------------- Side Bar (tool rail + project header + Explorer) -------- */
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  background: var(--vscode-sidebar-bg);
+  flex: none;
+  min-width: 200px;
+}
+
+/* Horizontal icon rail across the top of the side bar. */
+.sidebar-toolrail {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 6px;
+  background: var(--vscode-sidebar-bg);
+  border-bottom: 1px solid var(--vscode-border);
+  flex: none;
+}
+.toolrail-spacer { flex: 1; }
+.tool-item {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  background: none;
+  border: none;
+  border-radius: 5px;
+  color: var(--vscode-activitybar-fg);
+  cursor: pointer;
+  padding: 0;
+}
+.tool-item:hover { background: #2f2f30; color: var(--vscode-activitybar-active-fg); }
+.tool-item.active { color: var(--vscode-activitybar-active-fg); }
+
+/* Project header row: chevron + project name, collapses the whole tree. */
+.sidebar-project {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+  background: none;
+  border: none;
+  color: var(--vscode-sidebar-header-fg);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  flex: none;
+  text-align: left;
+}
+.sidebar-project:hover { color: #fff; }
+.project-chevron { display: inline-flex; transition: transform 0.1s; }
+.project-chevron.collapsed { transform: rotate(-90deg); }
+.project-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.sidebar-content { flex: 1; overflow: auto; min-height: 0; }
+
+/* ---------------- Editor area (dockview grid) ---------------- */
+.editor-area {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  background: var(--vscode-bg);
+}
+
+/* The dockview grid fills the editor area. theme={themeDark} applies
+ * dockview-theme-dark on the root element (which also carries .editor-dock). */
+.editor-dock { flex: 1; min-height: 0; min-width: 0; width: 100%; }
+
+/* ---------------- VS Code Dark+ theming for dockview ----------------
+ * Map dockview's CSS variables onto the workbench palette so groups, tabs,
+ * sashes, and the drag overlay read as native VS Code editor groups. */
+.dockview-theme-dark {
+  --dv-group-view-background-color: var(--vscode-bg);
+  --dv-tabs-and-actions-container-background-color: #252526;
+  --dv-activegroup-visiblepanel-tab-background-color: #1e1e1e;
+  --dv-activegroup-hiddenpanel-tab-background-color: #2d2d2d;
+  --dv-inactivegroup-visiblepanel-tab-background-color: #1e1e1e;
+  --dv-inactivegroup-hiddenpanel-tab-background-color: #2d2d2d;
+  --dv-activegroup-visiblepanel-tab-color: #ffffff;
+  --dv-activegroup-hiddenpanel-tab-color: rgba(255, 255, 255, 0.5);
+  --dv-inactivegroup-visiblepanel-tab-color: rgba(255, 255, 255, 0.65);
+  --dv-inactivegroup-hiddenpanel-tab-color: rgba(255, 255, 255, 0.35);
+  --dv-separator-border: var(--vscode-border);
+  --dv-paneview-header-border-color: var(--vscode-border);
+  --dv-drag-over-background-color: rgba(0, 122, 204, 0.18);
+  --dv-drag-over-border-color: var(--vscode-accent);
+  --dv-tabs-and-actions-container-font-size: 13px;
+  --dv-tabs-and-actions-container-height: 35px;
+  --dv-tab-divider-color: #252526;
+  --dv-scrollbar-background-color: rgba(121, 121, 121, 0.4);
+}
+
+/* ---------------- File tab content (icon + label + dirty/close) ----------
+ * Rendered inside dockview's tab host by the `fileTab` component. Reuses the
+ * VS Code tab metrics; the dockview tab supplies the background/active state. */
+.dv-file-tab {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  padding: 0 4px 0 10px;
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+}
+.editor-tab-icon {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  margin-right: 6px; /* gap between file icon and label */
+}
+.editor-tab-icon svg { width: 16px; height: 16px; }
+.editor-tab-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.editor-tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin-left: 6px; /* gap between label and close */
+  border: none;
+  background: none;
+  color: inherit;
+  font-size: 16px;
+  line-height: 1;
+  border-radius: 5px; /* VS Code toolbar hover radius */
+  cursor: pointer;
+  flex: none;
+  padding: 0;
+}
+.editor-tab-close:hover { background: rgba(90, 93, 94, 0.31); color: #fff; } /* toolbar.hoverBackground */
+.editor-tab-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  display: inline-block;
+}
+
+/* ---------------- Sashes ---------------- */
+.sash {
+  flex: none;
+  position: relative;
+  z-index: 30;
+  background: transparent;
+  transition: background 0.1s;
+  touch-action: none;
+}
+.sash-vertical { width: 4px; cursor: col-resize; }
+.sash-horizontal { height: 4px; cursor: row-resize; }
+.sash:hover, .sash.active { background: var(--vscode-accent); }
+
+/* While dragging any sash, iframes must not swallow the mousemove stream. */
+.is-resizing iframe { pointer-events: none !important; }
+
+/* ---------------- Status Bar ---------------- */
+.statusbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 22px;
+  padding: 0 10px;
+  background: var(--vscode-statusbar-bg);
+  color: var(--vscode-statusbar-fg);
+  font-size: 12px;
+  flex: none;
+  user-select: none;
+  border-top: 1px solid var(--vscode-border);
+}
+.statusbar-left, .statusbar-right { display: flex; align-items: center; gap: 4px; }
+.statusbar-item { padding: 0 8px; white-space: nowrap; }
+.statusbar-file { font-weight: 500; }
+
+/* ---------------- Panes (engine hosts) ----------------
+ * Hosts use position:absolute;inset:0 to fill the panel. Dockview's content
+ * wrappers are position:static by default, so without a local containing
+ * block the nearest positioned ancestor is `.dv-view` (the whole group) —
+ * Monaco/preview then paint over the tab strip (tabs flash, then vanish). */
+.dv-content-container,
+.dv-react-part {
+  position: relative;
+  height: 100%;
+  overflow: hidden;
+}
+.editor-host { position: absolute; inset: 0; }
+.preview-host { position: absolute; inset: 0; }
+.pane-iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: none; }
+/* Install console fills the entire preview pane while installing. */
+.install-console {
+  position: absolute;
+  inset: 0;
+  overflow: auto;
+  background: #0c0c0c;
+  color: #ddd;
+  font-family: 'Cascadia Code', Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 12px 14px;
+  z-index: 5;
+}
+.hidden { display: none !important; }

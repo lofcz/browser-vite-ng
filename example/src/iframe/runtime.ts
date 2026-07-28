@@ -24,7 +24,17 @@ type Payload =
   | { type: 'update'; updates: HotUpdate[] }
   | { type: 'full-reload'; path?: string }
   | { type: 'prune'; paths: string[] }
-  | { type: 'error'; err: { message: string; stack?: string } }
+  | {
+      type: 'error'
+      err: {
+        message: string
+        stack?: string
+        frame?: string
+        plugin?: string
+        loc?: { file?: string; line: number; column: number }
+        id?: string
+      }
+    }
   | { type: 'custom'; event: string; data?: unknown };
 
 type Lexer = {
@@ -254,10 +264,23 @@ async function installRefreshPreamble(): Promise<void> {
   );
 }
 
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
 // Error overlay lives in a SEPARATE container so it never clobbers #root —
 // otherwise React's root (created against #root's original children) loses
 // its container content and a later successful update cannot recover.
-function showErrorOverlay(title: string, message: string, stack?: string): void {
+function showErrorOverlay(
+  title: string,
+  message: string,
+  stack?: string,
+  extra?: { frame?: string; plugin?: string; loc?: string },
+): void {
   let overlay = document.getElementById('hmr-error-overlay');
   if (!overlay) {
     overlay = document.createElement('div');
@@ -265,8 +288,17 @@ function showErrorOverlay(title: string, message: string, stack?: string): void 
     overlay.className = 'hmr-error';
     document.body.appendChild(overlay);
   }
+  // Escape HTML — JSX/parse errors routinely contain `<`/`>` and would otherwise
+  // break the overlay markup (empty / half-rendered "error state").
+  const meta = [
+    extra?.plugin ? `[plugin: ${extra.plugin}]` : '',
+    extra?.loc ? extra.loc : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+  const body = [meta, message, extra?.frame, stack].filter(Boolean).join('\n');
   overlay.innerHTML =
-    '<h2>' + title + '</h2><pre>' + message + (stack ? '\n' + stack : '') + '</pre>';
+    '<h2>' + escapeHtml(title) + '</h2><pre>' + escapeHtml(body) + '</pre>';
   overlay.style.display = 'block';
   // Lock background scroll while the overlay is up (the overlay itself still
   // scrolls its own content via overflow:auto).
@@ -359,10 +391,19 @@ async function handlePayload(payload: Payload): Promise<void> {
         if (disp) await disp(dataMap.get(p));
       }
       break;
-    case 'error':
-      hmrLog('HMR Error: ' + payload.err.message);
-      showErrorOverlay('HMR Error', payload.err.message, payload.err.stack);
+    case 'error': {
+      const { err } = payload;
+      hmrLog('HMR Error: ' + err.message);
+      const loc = err.loc
+        ? `${err.loc.file || err.id || ''}:${err.loc.line}:${err.loc.column}`
+        : err.id;
+      showErrorOverlay('HMR Error', err.message, err.stack, {
+        frame: err.frame,
+        plugin: err.plugin,
+        loc,
+      });
       break;
+    }
     default:
       break;
   }

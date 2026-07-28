@@ -15,6 +15,7 @@ import type { BrowserResolvedConfig } from './config'
 import { PluginContainer } from './pluginContainer'
 import { ModuleGraph, ModuleNode } from './moduleGraph'
 import { importAnalysisTransform, isExplicitImportRequired } from './plugins/importAnalysis'
+import { cssAnalysisPlugin } from '../node/plugins/css'
 import { transformWithOxc, transformCssDev } from './transform'
 import { addRefreshWrapper } from './plugins/refresh'
 import {
@@ -63,6 +64,8 @@ export class BrowserServer {
   /** Deps-optimizer manifest (bare specifier -> /@deps/* URL). */
   optimizedDeps: Record<string, string>
   private hotChannel: HotChannel
+  /** Real upstream `vite:css-analysis` handler, bound to the browser module graph. */
+  private cssAnalysis?: (id: string) => void
 
   constructor(opts: BrowserServerOptions) {
     this.hotChannel = opts.hot
@@ -184,6 +187,7 @@ export class BrowserServer {
         isCSSRequest,
       })
       code = analyzed?.code ?? code
+      this.runCssAnalysis(id)
       const out = { code, map: null }
       mod.transformResult = out
       return out
@@ -245,6 +249,36 @@ export class BrowserServer {
     const out = { code, map: analyzed?.map ?? viaPlugins.map ?? oxc.map ?? null }
     mod.transformResult = out
     return out
+  }
+
+  /**
+   * Run the REAL upstream `vite:css-analysis` transform handler against the
+   * browser module graph. import-analysis intentionally skips module-graph
+   * updates for CSS, deferring to this plugin — it marks plain CSS modules
+   * self-accepting so an edit hot-swaps in place (`css-update`) instead of
+   * triggering a full page reload. The handler only reads
+   * `this.environment.moduleGraph` and `this._addedImports`, so we bind just
+   * that surface of the dev environment (no Node server required).
+   */
+  private runCssAnalysis(id: string): void {
+    if (!this.cssAnalysis) {
+      const plugin = cssAnalysisPlugin(this.config as never)
+      const handler =
+        typeof plugin.transform === 'object' && plugin.transform !== null
+          ? (plugin.transform as { handler: unknown }).handler
+          : plugin.transform
+      const ctx = {
+        environment: this.environment,
+        _addedImports: undefined,
+      }
+      this.cssAnalysis = (cssId) =>
+        (handler as (this: unknown, code: string, id: string) => void).call(
+          ctx,
+          '',
+          cssId,
+        )
+    }
+    this.cssAnalysis(id)
   }
 
   private registerModule(mod: ModuleNode): void {

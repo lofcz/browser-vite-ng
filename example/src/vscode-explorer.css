@@ -1,0 +1,133 @@
+/* VS Code Dark+ faithful Explorer styles for @pierre/trees.
+ *
+ * The tree renders inside a shadow root, so ordinary descendant selectors
+ * can't reach its rows. Instead we map the real `--vscode-*` Dark+ theme
+ * tokens onto the tree's `--trees-*-override` custom properties on the host
+ * element (custom properties inherit through the shadow boundary). The tree
+ * paints its rows, focus ring, selection, search input, and Git badges from
+ * those variables.
+ *
+ * The context menu is NOT in the shadow root — it's a React-rendered element
+ * slotted from the light DOM — so it keeps its own plain class rules below.
+ */
+
+.vscode-explorer {
+  /* Source tokens (Dark+ color registry values). */
+  --vscode-sideBar-background: #252526;
+  --vscode-sideBar-foreground: #cccccc;
+  --vscode-sideBarTitle-foreground: #bbbbbb;
+  --vscode-list-hoverBackground: #2a2d2e;
+  --vscode-list-hoverForeground: #ffffff;
+  --vscode-list-activeSelectionBackground: #094771;
+  --vscode-list-activeSelectionForeground: #ffffff;
+  --vscode-list-inactiveSelectionBackground: #37373d;
+  --vscode-list-inactiveSelectionForeground: #cccccc;
+  --vscode-list-focusOutline: #007fd4;
+  --vscode-list-focusAndSelectionOutline: #90c2f9;
+  --vscode-list-highlightForeground: #2aaaff;
+  --vscode-tree-indentGuidesStroke: #585858;
+  --vscode-focusBorder: #007fd4;
+  --vscode-input-background: #3c3c3c;
+  --vscode-input-foreground: #cccccc;
+  --vscode-input-border: #007fd4;
+  --vscode-menu-background: #303031;
+  --vscode-menu-foreground: #cccccc;
+  --vscode-menu-selectionBackground: #094771;
+  --vscode-menu-selectionForeground: #ffffff;
+  --vscode-menu-separatorBackground: #454545;
+  --vscode-widget-shadow: rgba(0, 0, 0, 0.36);
+  --vscode-errorForeground: #f48771;
+  --vscode-gitDecoration-modifiedResource: #e2c08d;
+
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--vscode-sideBar-background);
+  color: var(--vscode-sideBar-foreground);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe WPC', 'Segoe UI', 'Helvetica Neue', sans-serif;
+  font-size: 13px;
+  user-select: none;
+  overflow: hidden;
+}
+
+/* ---- @pierre/trees host: theme + layout ----------------------------------
+ * The <file-tree-container> host fills the sidebar. All visual overrides are
+ * custom properties here; they cross the shadow boundary and win over the
+ * library defaults via its `--trees-*` -> `--trees-*-override` fallback chain.
+ */
+.vscode-tree-host {
+  flex: 1;
+  min-height: 0;
+  display: block;
+  color-scheme: dark;
+
+  --trees-bg-override: var(--vscode-sideBar-background);
+  --trees-fg-override: var(--vscode-sideBar-foreground);
+  --trees-fg-muted-override: var(--vscode-sideBarTitle-foreground);
+  --trees-bg-muted-override: var(--vscode-list-hoverBackground);
+  --trees-accent-override: var(--vscode-focusBorder);
+
+  --trees-selected-bg-override: var(--vscode-list-activeSelectionBackground);
+  --trees-selected-fg-override: var(--vscode-list-activeSelectionForeground);
+  --trees-selected-focused-border-color-override: var(--vscode-list-focusOutline);
+  --trees-focus-ring-color-override: var(--vscode-focusBorder);
+
+  --trees-search-bg-override: var(--vscode-input-background);
+  --trees-search-fg-override: var(--vscode-input-foreground);
+  --trees-border-color-override: var(--vscode-input-border);
+
+  --trees-indent-guide-bg-override: var(--vscode-tree-indentGuidesStroke);
+
+  /* Unsaved ("modified") badge color, matching VS Code's git decoration. */
+  --trees-status-modified-override: var(--vscode-gitDecoration-modifiedResource);
+  --trees-git-modified-color-override: var(--vscode-gitDecoration-modifiedResource);
+
+  --trees-font-family-override: inherit;
+  --trees-font-size-override: 13px;
+
+  /* VS Code list density: flush rows, no item pill margins/rounding/gaps. */
+  --trees-item-margin-x-override: 0px;
+  --trees-item-padding-x-override: 4px;
+  --trees-item-row-gap-override: 0px;
+  --trees-gap-override: 0px;
+  --trees-padding-inline-override: 0px;
+  --trees-border-radius-override: 0px;
+
+  --trees-scrollbar-thumb-override: rgba(121, 121, 121, 0.4);
+}
+
+/* ---- Context menu (monaco .context-view / .monaco-menu look) --------------
+ * Rendered by React into the light-DOM `context-menu` slot, so these plain
+ * class selectors apply normally (not subject to the shadow boundary).
+ */
+.vscode-menu {
+  min-width: 160px;
+  background: var(--vscode-menu-background);
+  color: var(--vscode-menu-foreground);
+  border: 1px solid var(--vscode-menu-separatorBackground);
+  border-radius: 5px;
+  box-shadow: 0 2px 8px var(--vscode-widget-shadow);
+  padding: 4px 0;
+  font-size: 13px;
+}
+.vscode-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 4px 20px;
+  background: none;
+  border: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  box-sizing: border-box;
+  white-space: nowrap;
+}
+.vscode-menu-item:hover {
+  background: var(--vscode-menu-selectionBackground);
+  color: var(--vscode-menu-selectionForeground);
+}
+.vscode-menu-item.danger:hover {
+  background: var(--vscode-errorForeground);
+  color: #ffffff;
+}

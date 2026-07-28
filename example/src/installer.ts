@@ -10,7 +10,8 @@
  * ustar parser (npm tarballs are plain ustar).
  */
 
-import { setVirtualFile, withVirtualFileBatch } from 'browser-vite';
+import { setVirtualFile, readVirtualFile, withVirtualFileBatch } from 'browser-vite';
+import { getCachedVersions, removeInstalledPackage } from './dep-cache';
 
 export interface ResolvedDep {
   name: string;
@@ -63,30 +64,51 @@ function fetchPackument(name: string): Promise<Packument> {
   return p;
 }
 
+/**
+ * Resolve a package to a concrete version.
+ *
+ * The IndexedDB dep cache *announces* the versions it already holds for this
+ * package; those become extra semver candidates alongside the registry's. A
+ * cached version that satisfies the requested range is therefore a valid pick;
+ * a NON-satisfying cached version is correctly ignored by `maxSatisfying` —
+ * which is the bug this fixes. The freshly-downloaded version always REPLACES
+ * any stale cached copy of the same package so the cache can never shadow the
+ * resolver's pick.
+ */
 export async function resolveDep(name: string, range: string): Promise<ResolvedDep> {
-  const doc = await fetchPackument(name);
-  const versions = Object.keys(doc.versions ?? {});
-  const tags = doc['dist-tags'] ?? {};
   const r = range.trim();
+  const cachedVersions = await getCachedVersions(name);
 
-  // Non-semver specifiers: dist-tags ("latest", "next") and bare "*"/"".
-  // `maxSatisfying` (with includePrerelease:false, the default) already
-  // excludes prereleases from non-prerelease ranges, which is exactly the
-  // behaviour that previously had to be hand-rolled.
+  // Offer the cached versions as additional semver candidates alongside the
+  // registry's. A cached version that satisfies the range is therefore a valid
+  // pick (the cache announces what it holds); a NON-satisfying cached version
+  // is correctly ignored by maxSatisfying — which is the bug this fixes.
+  const doc = await fetchPackument(name);
+  const registryVersions = Object.keys(doc.versions ?? {});
+  const tags = doc['dist-tags'] ?? {};
+  const allVersions = [...new Set([...registryVersions, ...cachedVersions])];
+
   let version: string | undefined;
   if (r === '' || r === '*') {
-    version = maxSatisfying(versions, '*') ?? tags.latest;
+    version = maxSatisfying(allVersions, '*') ?? tags.latest;
   } else if (tags[r]) {
     version = tags[r];
   } else if (validRange(r) || valid(r)) {
-    version = maxSatisfying(versions, r) ?? undefined;
+    version = maxSatisfying(allVersions, r) ?? undefined;
+    // A well-formed semver range that matches NOTHING (in the registry or the
+    // cache) is a hard error — npm behaves the same. We must NOT silently fall
+    // back to `latest`, or an unsatisfiable range (e.g. ^190.2.8 when only
+    // 19.x exists) would resolve to a cached `latest` and the stale IndexedDB
+    // bundle would be reused — exactly the bug reported.
+    if (!version) throw new Error(`No version of ${name} satisfies ${range}`);
   } else {
-    // Unknown specifier (e.g. a dist-tag not present, or a URL) — try latest.
+    // Unknown specifier (URL, git, unknown tag): only latest makes sense.
     version = tags.latest;
   }
 
-  version = version ?? tags.latest ?? versions[versions.length - 1];
+  version = version ?? tags.latest;
   if (!version) throw new Error(`No version of ${name} satisfies ${range}`);
+
   const meta = doc.versions?.[version];
   const tarball = meta?.dist?.tarball;
   if (!tarball) throw new Error(`No tarball for ${name}@${version}`);
@@ -137,6 +159,60 @@ function untar(data: Uint8Array): Map<string, Uint8Array> {
 }
 
 const KEEP_EXT = /\.(m?js|cjs|json|ts|tsx|jsx|mts|cts|css|d\.ts)$/i;
+
+/**
+ * DefinitelyTyped package name for a runtime package.
+ * `react` → `@types/react`, `@babel/core` → `@types/babel__core`.
+ */
+function atTypesPackageName(pkgName: string): string {
+  if (pkgName.startsWith('@types/')) return pkgName;
+  if (pkgName.startsWith('@')) {
+    const [scope, name] = pkgName.slice(1).split('/');
+    return `@types/${scope}__${name}`;
+  }
+  return `@types/${pkgName}`;
+}
+
+/** Prefer the same major as the runtime package (`react@19.2.8` → `@types/react@^19`). */
+function atTypesRangeFor(version: string): string {
+  const major = version.split('.')[0];
+  return major && /^\d+$/.test(major) ? `^${major}` : '*';
+}
+
+/** True when the unpacked package already ships usable type declarations. */
+function packageHasTypes(pkgName: string): boolean {
+  const raw = readVirtualFile(`/node_modules/${pkgName}/package.json`);
+  if (!raw) return false;
+  try {
+    const pkg = JSON.parse(raw) as {
+      types?: unknown;
+      typings?: unknown;
+      exports?: unknown;
+    };
+    if (typeof pkg.types === 'string' || typeof pkg.typings === 'string') return true;
+    if (readVirtualFile(`/node_modules/${pkgName}/index.d.ts`) !== undefined) return true;
+    // exports["."].types or exports.types
+    const exportsField = pkg.exports;
+    if (exportsField && typeof exportsField === 'object') {
+      const root =
+        (exportsField as Record<string, unknown>)['.'] ?? exportsField;
+      if (root && typeof root === 'object' && 'types' in (root as object)) return true;
+    }
+  } catch {
+    // ignore malformed package.json
+  }
+  return false;
+}
+
+/** Registry probe: does `@types/<pkg>` exist? Missing packages 404. */
+async function atTypesPackageExists(typesName: string): Promise<boolean> {
+  try {
+    const doc = await fetchPackument(typesName);
+    return !!doc.versions && Object.keys(doc.versions).length > 0;
+  } catch {
+    return false;
+  }
+}
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -203,7 +279,11 @@ async function unpackIntoVfs(
   // modules), which is what made untarring thousands of files feel slow.
   withVirtualFileBatch(() => {
     for (const [path, bytes] of entries) {
-      const rel = path.replace(/^package\//, '');
+      // npm tarballs always nest under ONE top-level dir. Most packages use
+      // `package/`; DefinitelyTyped (`@types/*`) uses the unscoped name
+      // (`react/index.d.ts`, …). Strip whichever it is so files land at
+      // `/node_modules/<name>/index.d.ts`, not `/node_modules/@types/react/react/…`.
+      const rel = path.replace(/^[^/]+\//, '');
       if (!rel || !KEEP_EXT.test(rel)) continue;
       const text = textDecoder.decode(bytes);
       setVirtualFile(`/node_modules/${dep.name}/${rel}`, text);
@@ -255,11 +335,62 @@ export async function installDependencies(
   const seen = new Set<string>();
   const CONCURRENCY = 6;
 
+  /** True when VFS already has this package at the exact resolved version. */
+  function alreadyUnpacked(name: string, version: string): boolean {
+    const raw = readVirtualFile(`/node_modules/${name}/package.json`);
+    if (!raw) return false;
+    try {
+      return (JSON.parse(raw) as { version?: string }).version === version;
+    } catch {
+      return false;
+    }
+  }
+
   async function processOne(name: string, range: string): Promise<void> {
     report(`Resolving ${name}@${range}…`);
     const dep = await resolveDep(name, range);
     installed.set(name, dep);
-    await unpackIntoVfs(dep, log, report);
+    // Skip download/untar when the VFS already has this exact version — reload
+    // with a warm IndexedDB dep cache used to re-unpack every tarball and stall
+    // Install for many seconds.
+    if (alreadyUnpacked(name, dep.version)) {
+      log(`${name}@${dep.version}: already in VFS — skipped`);
+    } else if (name.startsWith('@types/')) {
+      // IntelliSense resolves decls through the host esm.sh import map, not
+      // `/node_modules/@types/*`. Unpack only a version marker so the install
+      // graph stays consistent without dragging multi‑MB DefinitelyTyped trees
+      // through the VFS on every cold load.
+      removeInstalledPackage(name);
+      withVirtualFileBatch(() => {
+        setVirtualFile(
+          `/node_modules/${name}/package.json`,
+          JSON.stringify({ name, version: dep.version, private: true }, null, 2),
+        );
+      });
+      log(`${name}@${dep.version}: types via esm.sh — skipped VFS unpack`);
+    } else {
+      // Clear any stale cached version of the same package so it can't shadow
+      // the version the resolver actually picked, then unpack the tarball.
+      removeInstalledPackage(name);
+      await unpackIntoVfs(dep, log, report);
+    }
+
+    // Keep DefinitelyTyped decls in sync with direct package.json deps: packages
+    // like `react` ship no .d.ts, so IntelliSense needs `@types/react` (incl.
+    // `react/jsx-runtime`) installed alongside — the same expectation tsc has.
+    // Only direct deps: transitive untyped packages (e.g. scheduler) are not
+    // imported by app code and don't need @types pulled in automatically.
+    if (name in direct && !name.startsWith('@types/') && !packageHasTypes(name)) {
+      const typesName = atTypesPackageName(name);
+      if (!installed.has(typesName) && !seen.has(typesName)) {
+        if (await atTypesPackageExists(typesName)) {
+          seen.add(typesName);
+          enqueue(typesName, atTypesRangeFor(dep.version));
+          log(`${name}: no bundled types — also installing ${typesName}`);
+        }
+      }
+    }
+
     // Recurse into transitive deps (first-seen wins, like a flat install).
     for (const [dn, dr] of Object.entries(dep.dependencies)) {
       if (!installed.has(dn) && !seen.has(dn)) {
@@ -271,27 +402,43 @@ export async function installDependencies(
 
   // Scheduler: keep up to CONCURRENCY packages resolving/unpacking at once.
   // Returns a promise that resolves when the queue is drained AND nothing is
-  // in flight (so transitively-discovered deps are always processed).
+  // in flight (so transitively-discovered deps are always processed). A package
+  // that fails to resolve (e.g. an unsatisfiable range) rejects the whole
+  // install instead of silently dropping the package — otherwise a failed dep
+  // would vanish and the stale cache bundle could still be reused.
   const running = new Set<Promise<void>>();
   let resolveDone!: () => void;
-  const done = new Promise<void>((r) => (resolveDone = r));
+  let rejectDone!: (err: unknown) => void;
+  const done = new Promise<void>((res, rej) => {
+    resolveDone = res;
+    rejectDone = rej;
+  });
+  let failed = false;
   let scheduled = false;
 
   function schedule(): void {
-    if (scheduled) return;
+    if (scheduled || failed) return;
     scheduled = true;
     queueMicrotask(() => {
       scheduled = false;
+      if (failed) return;
       while (queue.length && running.size < CONCURRENCY) {
         const [name, range] = queue.shift()!;
         if (installed.has(name)) continue;
-        const p = processOne(name, range).finally(() => {
-          running.delete(p);
-          schedule();
-        });
+        const p = processOne(name, range)
+          .catch((err) => {
+            if (!failed) {
+              failed = true;
+              rejectDone(err);
+            }
+          })
+          .finally(() => {
+            running.delete(p);
+            schedule();
+          });
         running.add(p);
       }
-      if (running.size === 0 && queue.length === 0) resolveDone();
+      if (!failed && running.size === 0 && queue.length === 0) resolveDone();
     });
   }
 

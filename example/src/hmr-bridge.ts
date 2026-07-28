@@ -101,6 +101,12 @@ export function createViteHmrIframeHtml(indexHtml: string, clientBootstrap: stri
   for (const s of Array.from(doc.querySelectorAll('script[type="module"][src]'))) {
     s.remove();
   }
+  // Strip any user importmap from the preview document. The preview resolves
+  // bare imports through optimized-deps, not the browser's native import map
+  // (which would hijack them to CDN URLs and break HMR).
+  for (const s of Array.from(doc.querySelectorAll('script[type="importmap"]'))) {
+    s.remove();
+  }
   const runtime = doc.createElement('script');
   runtime.type = 'module';
   runtime.textContent = clientBootstrap;

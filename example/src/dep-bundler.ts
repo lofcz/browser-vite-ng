@@ -541,6 +541,9 @@ export async function bundleDeps(
 export function defaultEntrySpecifiers(directNames: string[]): string[] {
   const specs = new Set<string>();
   for (const name of directNames) {
+    // DefinitelyTyped packages are for the TS language service only — they
+    // have no runtime entry to optimize for the preview iframe.
+    if (name.startsWith('@types/')) continue;
     specs.add(name);
     if (name === 'react') specs.add('react/jsx-runtime');
     if (name === 'react-dom') {

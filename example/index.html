@@ -4,73 +4,21 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Browser-Vite Live Editor</title>
+    <!-- modern-monaco's init() lazy-loads its editor-core and builtin LSP from
+         esm.sh unless the page importmap maps them to local URLs. Point both at
+         the /monaco/* URLs served by the monacoModulesPlugin so the editor is
+         fully offline. -->
+    <script type="importmap">
+      {
+        "imports": {
+          "modern-monaco/editor-core": "/monaco/editor-core.mjs",
+          "modern-monaco/lsp": "/monaco/lsp.mjs"
+        }
+      }
+    </script>
   </head>
   <body class="font-sans m-0 p-0 h-screen overflow-hidden">
-    <div class="flex flex-col h-screen">
-      <header class="flex items-center justify-between px-5 py-2.5 bg-[hsl(var(--card))] border-b border-[hsl(var(--border))] shrink-0">
-        <h1 class="text-[hsl(var(--primary))] m-0 text-xl font-bold">Browser-Vite Live Editor</h1>
-        <div class="flex items-center gap-4">
-          <span id="depsStatus" class="font-mono text-xs text-[hsl(var(--muted-foreground))]" title="Dependency status"></span>
-          <div id="status" class="px-3 py-1.5 rounded font-mono text-xs bg-amber-900/50 border border-amber-700">Initializing...</div>
-          <button id="installDeps" class="bg-[hsl(var(--secondary))] text-[hsl(var(--foreground))] border border-[hsl(var(--border))] px-4 py-2 rounded cursor-pointer text-sm hover:bg-[hsl(var(--accent))] disabled:opacity-50 disabled:cursor-not-allowed" disabled>Install</button>
-          <label class="flex items-center gap-1.5 text-sm cursor-pointer">
-            <input type="checkbox" id="autoRun" checked disabled />
-            Auto-run
-          </label>
-          <button id="runCode" class="bg-[hsl(var(--primary))] text-white border border-[hsl(var(--primary))] px-4 py-2 rounded cursor-pointer text-sm hover:opacity-80 disabled:opacity-50 disabled:cursor-not-allowed" disabled>Run</button>
-        </div>
-      </header>
-
-      <div class="flex flex-1 overflow-hidden">
-        <div class="w-[200px] bg-[hsl(var(--sidebar-background))] border-r border-[hsl(var(--border))] flex flex-col shrink-0">
-          <div class="px-4 py-2 bg-[hsl(var(--secondary))] text-xs text-[hsl(var(--muted-foreground))] border-b border-[hsl(var(--border))] flex justify-between items-center">
-            <span>Files</span>
-            <button id="newFileBtn" class="bg-[hsl(var(--secondary))] text-[hsl(var(--foreground))] border border-[hsl(var(--border))] px-2 py-1 rounded cursor-pointer text-[11px] hover:bg-[hsl(var(--accent))]" title="New File">+ New</button>
-          </div>
-          <div id="fileTree" class="flex-1 overflow-y-auto py-2"></div>
-        </div>
-        <div class="flex-1 flex flex-col border-r border-[hsl(var(--border))] min-w-[300px]">
-          <div class="px-4 py-2 bg-[hsl(var(--secondary))] text-xs text-[hsl(var(--muted-foreground))] border-b border-[hsl(var(--border))] flex items-center gap-2">
-            <span class="text-[hsl(var(--muted-foreground))]">/src/</span>
-            <span id="currentFileName" class="text-[hsl(var(--foreground))] font-medium">App.tsx</span>
-          </div>
-          <div id="editor" class="flex-1 overflow-hidden [&_.cm-editor]:h-full"></div>
-        </div>
-        <div class="w-[45%] flex flex-col min-w-[300px]">
-          <div class="px-4 py-2 bg-[hsl(var(--secondary))] text-xs text-[hsl(var(--muted-foreground))] border-b border-[hsl(var(--border))] flex justify-between">
-            <span>Preview</span>
-            <span class="flex items-center gap-2.5">
-              <span id="previewStatus"></span>
-              <button id="devtoolsToggle" class="devtools-toggle bg-[hsl(var(--secondary))] text-[hsl(var(--foreground))] border border-[hsl(var(--border))] px-2 py-1 rounded cursor-pointer text-[11px] hover:bg-[hsl(var(--accent))]" title="Toggle DevTools">DevTools</button>
-            </span>
-          </div>
-          <div class="flex-1 relative min-h-0">
-            <iframe id="preview" class="absolute inset-0 w-full h-full border-none bg-white" sandbox="allow-scripts allow-same-origin"></iframe>
-            <!-- Install progress console: overlays the preview while deps install -->
-            <div id="installConsole" class="hidden absolute inset-0 overflow-y-auto bg-[#0d1117] text-[#c9d1d9] font-mono text-[13px] leading-relaxed p-4"></div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Embedded DevTools Panel -->
-      <div id="devtoolsPanel" class="devtools-panel hidden h-[350px] border-t border-[hsl(var(--border))] shrink-0 relative">
-        <div class="devtools-resize-handle absolute top-0 left-0 right-0 h-1.5 cursor-ns-resize bg-transparent hover:bg-[hsl(var(--primary))]/30" id="devtoolsResizeHandle"></div>
-        <iframe id="devtoolsFrame" class="w-full h-full border-none"></iframe>
-      </div>
-    </div>
-
-    <!-- New File Modal -->
-    <div id="newFileModal" class="modal-overlay hidden fixed inset-0 bg-black/70 z-[100] items-center justify-center">
-      <div class="bg-[hsl(var(--background))] border border-[hsl(var(--border))] rounded-lg p-5 min-w-[300px]">
-        <h3 class="m-0 mb-4 text-[hsl(var(--primary))]">Create New File</h3>
-        <input type="text" id="newFileName" class="w-full px-2.5 py-2.5 bg-[hsl(var(--sidebar-background))] border border-[hsl(var(--border))] rounded text-[hsl(var(--foreground))] text-sm mb-4 focus:outline-none focus:border-[hsl(var(--primary))]" placeholder="filename.tsx" />
-        <div class="flex gap-2.5 justify-end">
-          <button id="cancelNewFile" class="bg-[hsl(var(--secondary))] text-[hsl(var(--foreground))] border border-[hsl(var(--border))] px-4 py-2 rounded cursor-pointer text-sm hover:bg-[hsl(var(--accent))]">Cancel</button>
-          <button id="createNewFile" class="bg-[hsl(var(--primary))] text-white border border-[hsl(var(--primary))] px-4 py-2 rounded cursor-pointer text-sm hover:opacity-80">Create</button>
-        </div>
-      </div>
-    </div>
-
-    <script type="module" src="/src/main.ts"></script>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

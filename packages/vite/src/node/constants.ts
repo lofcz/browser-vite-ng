@@ -1,11 +1,12 @@
 import path, { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { readFileSync } from 'node:fs'
 import type { RollupPluginHooks } from './typeUtils'
 
-const { version } = JSON.parse(
-  readFileSync(new URL('../../package.json', import.meta.url)).toString(),
-)
+// The browser fork runs against an in-memory VFS whose root is the USER's
+// project — it cannot read Vite's own on-disk package.json via
+// `new URL('../../package.json', import.meta.url)`. The version is a build
+// constant, so hardcode it (matches packages/vite/package.json + index.ts).
+const version = '8.1.5-browser.1'
 
 export const ROLLUP_HOOKS: RollupPluginHooks[] = [
   'options',
@@ -120,10 +121,13 @@ export const FS_PREFIX = `/@fs/`
 
 export const CLIENT_PUBLIC_PATH = `/@vite/client`
 export const ENV_PUBLIC_PATH = `/@vite/env`
-export const VITE_PACKAGE_DIR: string = resolve(
-  fileURLToPath(import.meta.url),
-  '../../..',
-)
+// BROWSER VITE patch: import.meta.url is a browser URL in the fork, so
+// fileURLToPath is unavailable/meaningless. The package dir is only used for
+// on-disk asset resolution (dist/client/*), which the fork serves from the
+// VFS instead — point it at a neutral virtual root.
+export const VITE_PACKAGE_DIR: string = process.env.VITE_BROWSER
+  ? '/'
+  : resolve(fileURLToPath(import.meta.url), '../../..')
 
 // BROWSER VITE patch: avoid path resolve that breaks when VITE_BROWSER is set
 export const CLIENT_ENTRY: string = process.env.VITE_BROWSER
